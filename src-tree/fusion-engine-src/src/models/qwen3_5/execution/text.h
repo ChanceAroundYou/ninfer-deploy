@@ -131,6 +131,13 @@ public:
     //
     // Both are no-ops when NINFER_TERNARY_KVMEM is off: raw_k_shadow_harvest_for() returns null and the
     // methods then do nothing at all, which is what keeps the OFF arm bit-identical.
+    //
+    // B06: the round is opened under the caller's sequence lane (SequenceState::lane), and every
+    // KVMem object the round touches -- harvest, index, score probe, norm/rope hook -- is indexed by
+    // that lane. A card is stack-constructed per chunk (raw_k_harvest.h:224-226), so the lane a card
+    // holds is exactly the lane its caller is running; the default 0 is the single-sequence arm.
+    void set_kvmem_lane(std::uint32_t lane) noexcept { kvmem_lane_ = lane; }
+
     void kvmem_round_begin();
     void kvmem_round_end();
 
@@ -278,8 +285,10 @@ private:
     // LOCAL (KVMem content scoring, 2026-10-02): the harvest round for the chunk in progress (opaque
     // so this header keeps no KVMem dependency), and the width the round was opened with. Both are
     // null/zero when the feature is off -- every reader then does nothing.
+    // B06: kvmem_lane_ selects WHICH per-lane harvest/index/probe/hook this card's round belongs to.
     void*         kvmem_harvest_       = nullptr;
     std::int32_t  kvmem_round_width_   = 0;
+    std::uint32_t kvmem_lane_          = 0;
     void* first_token_logits_ = nullptr;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;

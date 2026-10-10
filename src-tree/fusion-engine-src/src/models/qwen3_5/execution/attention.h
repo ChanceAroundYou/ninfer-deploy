@@ -22,7 +22,9 @@ void text_rope(const Tensor& positions, const RopeConfig& config, const ops::Rop
 // Normalize q and k and rotate them. Where the fused Op covers the geometry this is one graph node
 // instead of three; everywhere else it is the three calls it replaces, which are the same
 // arithmetic bit for bit. It chooses a schedule, not a result.
-void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
+// B06: `lane` (SequenceState::lane) selects which KVMem hook this pass reads; see the matching
+// definition in attention.cpp.
+void text_qk_norm_rope(std::uint32_t lane, const Tensor& positions, const RopeConfig& rope,
                        const AttentionConfig& attention, float rms_norm_eps,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
@@ -37,7 +39,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
 // `harvest` is an opaque pointer on purpose: this header is included by several translation units and
 // must not drag the KVMem headers into them. Null = feature off, and then every added line is a no-op,
 // so the OFF arm stays bit-identical (raw_k_shadow_harvest_for() returns null when the switch is off).
-void text_set_kvmem_hook(std::int32_t layer_index, std::int32_t chunk_tokens,
-                         void* harvest) noexcept;
+void text_set_kvmem_hook(std::uint32_t lane, std::int32_t layer_index,
+                         std::int32_t chunk_tokens, void* harvest) noexcept;
 
 } // namespace ninfer::models::qwen3_5::execution

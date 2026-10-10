@@ -700,7 +700,11 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             // LOCAL (KVMem query span, D-12, 2026-10-02): same publish as the ordinary prefill driver
             // (program/prefill.cpp) -- every prefill path that owns a prompt publishes that prompt's
             // span, so a span can never be stale from another request. See ops/kvmem/kvmem_score.h.
-            ops::detail::kvmem_score_set_query_span(prompt.query_span_begin, prompt.query_span_end);
+            // B06: lane 0. This is the causal-score prefill: it runs with no speculative backend and
+            // no generation, and it is mutually exclusive with it, so no lane exists to take and 0 is
+            // correct rather than merely safe.
+            ops::detail::kvmem_score_set_query_span(0, prompt.query_span_begin,
+                                                    prompt.query_span_end);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
                 false);

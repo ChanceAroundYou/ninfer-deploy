@@ -13,6 +13,10 @@
 #include "ops/kvmem/raw_k_harvest.h"
 #include "ops/kvmem/raw_k_shadow.h"
 
+// B06: kMaximumConcurrency, the per-lane hook array's size.
+#include <ninfer/types.h>
+
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -120,9 +124,19 @@ struct KvmemHook {
     bool          shape_noted = false; // the "this pass is not the armed round" line prints once
 };
 
-KvmemHook& kvmem_hook() {
-    static KvmemHook hook;
-    return hook;
+// B06: one hook per lane. The hook names the harvest the next text_qk_norm_rope call belongs to;
+// a process-wide hook let a concurrent prefill on another lane re-arm the round mid-pass, so the
+// keys that reached the index belonged to whichever lane ran last. Lane 0 is the old single hook.
+//
+// An out-of-range lane lands on an inert hook instead of indexing past the array: this accessor is
+// reachable from text_set_kvmem_hook, which is noexcept, and indexing out of bounds is exactly the
+// silent wrong-answer B06 removes. The throwing check for a bad lane lives upstream where the lane
+// enters the component (mean_k_index_for, kvmem_score_begin); this is only the backstop.
+KvmemHook& kvmem_hook(std::uint32_t lane) {
+    static std::array<KvmemHook, ninfer::kMaximumConcurrency> hooks;
+    static KvmemHook inert;   // never armed: reads as "not armed", writes go nowhere
+    if (lane >= ninfer::kMaximumConcurrency) { return inert; }
+    return hooks[lane];
 }
 
 // True while a round is armed for harvesting: the KVMem index wants this round's pre-RoPE keys, and
@@ -130,13 +144,14 @@ KvmemHook& kvmem_hook() {
 // for the hook; the fused Op rotates in a single pass and materialises no pre-RoPE tensor,
 // rmsnorm_rope.h:22-23 and :56-62). `tokens` is the width the round was armed with, so a pass of a
 // different shape still reports armed and is then skipped by kvmem_harvest_pre_rope's shape guard.
-bool kvmem_harvest_armed() {
-    const KvmemHook& hook = kvmem_hook();
+bool kvmem_harvest_armed(std::uint32_t lane) {
+    const KvmemHook& hook = kvmem_hook(lane);
     return hook.harvest != nullptr && hook.tokens > 0 && hook.layer >= 0;
 }
 
-void kvmem_harvest_pre_rope(const Tensor& query, const Tensor& key, cudaStream_t stream) {
-    KvmemHook& hook = kvmem_hook();
+void kvmem_harvest_pre_rope(std::uint32_t lane, const Tensor& query, const Tensor& key,
+                             cudaStream_t stream) {
+    KvmemHook& hook = kvmem_hook(lane);
     if (hook.harvest == nullptr || hook.tokens <= 0 || hook.layer < 0) { return; }
     // SHAPE GUARD. The staging view is sized by the width the hook was armed with, and the component
     // THROWS when the source does not match it (raw_k_shadow.h: geometry mismatch is an exception by
@@ -178,14 +193,15 @@ void kvmem_harvest_pre_rope(const Tensor& query, const Tensor& key, cudaStream_t
     // scorer segments it and sums the segments (B05 -- see the LOCAL FIX comment in kvmem_score.h), so
     // the delivered chunk width of 1024 no longer requires NINFER_TERNARY_KVMEM_SCORE_QUERY_TAIL to be
     // set for it.
-    ops::detail::kvmem_score_accumulate(hook.layer, query.data, hook.tokens, hook.tokens, stream);
+    ops::detail::kvmem_score_accumulate(lane, hook.layer, query.data, hook.tokens, hook.tokens,
+                                     stream);
 }
 
 } // namespace
 
-void text_set_kvmem_hook(std::int32_t layer_index, std::int32_t chunk_tokens,
-                         void* harvest) noexcept {
-    KvmemHook& hook = kvmem_hook();
+void text_set_kvmem_hook(std::uint32_t lane, std::int32_t layer_index,
+                         std::int32_t chunk_tokens, void* harvest) noexcept {
+    KvmemHook& hook = kvmem_hook(lane);
     hook.harvest = harvest;
     hook.layer   = layer_index;
     hook.tokens  = chunk_tokens;
@@ -197,7 +213,10 @@ void text_set_kvmem_hook(std::int32_t layer_index, std::int32_t chunk_tokens,
     static_cast<ops::RawKShadowHarvest*>(harvest)->set_round_width(chunk_tokens);
 }
 
-void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
+// B06: `lane` is the sequence's execution lane (SequenceState::lane), not a batch slot -- it is
+// what the KVMem round was opened under, and the hook it reads is the one that round armed. Lane 0
+// reproduces the pre-B06 single-hook behaviour exactly.
+void text_qk_norm_rope(std::uint32_t lane, const Tensor& positions, const RopeConfig& rope,
                        const AttentionConfig& attention, float rms_norm_eps,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
@@ -211,7 +230,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
     // documented bit-identical (rmsnorm_rope.h:56-62), so routing an armed round through the three
     // calls changes no numerics; it only gives up the fused Op's own 22-52% edge at <= 256 tokens,
     // and only for the rounds the index is armed for.
-    if (!yarn.active() && !kvmem_harvest_armed() &&
+    if (!yarn.active() && !kvmem_harvest_armed(lane) &&
         fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, stream);
@@ -219,7 +238,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
     }
     ops::rmsnorm(query, q_norm_weight, rms_norm_eps, true, normalized_query, stream);
     ops::rmsnorm(key, k_norm_weight, rms_norm_eps, true, normalized_key, stream);
-    kvmem_harvest_pre_rope(normalized_query, normalized_key, stream);
+    kvmem_harvest_pre_rope(lane, normalized_query, normalized_key, stream);
     ops::rope(positions, dimension(rope.rotary_dim), rope.rope_theta, yarn, normalized_query,
               normalized_key, stream);
 }

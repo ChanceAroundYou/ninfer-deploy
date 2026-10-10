@@ -14,6 +14,9 @@
 
 #include <algorithm>
 #include <array>
+
+// B06: kMaximumConcurrency, the width of the per-lane KVMem slot arrays.
+#include <ninfer/types.h>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -81,6 +84,9 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     card.set_layer_ready(state.layer_ready);
+    // B06: bind the card to this sequence's lane BEFORE the round opens, so the harvest, index,
+    // scorer, and norm/rope hook the round arms are the ones belonging to this sequence.
+    card.set_kvmem_lane(state.lane);
     // LOCAL (KVMem content scoring, 2026-10-02): open the harvest + scoring round BEFORE the chunk, so
     // the index it scores against is history (this chunk is appended at the tail). No-op when the
     // switch is off. The D2H in the tail half is only legal here -- outside any capture.
@@ -1128,7 +1134,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.source,
             selectors.destination,
             staged.initial_mtp_extent,
-            dflash_host_ingress};
+            dflash_host_ingress,
+            sequence.lane};
         const auto public_tokens =
             static_cast<std::size_t>(dimension(parameters.model.resources().public_token_count));
         if (request.first_token_top_logprobs != 0) {
@@ -1199,7 +1206,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // from; -1 (no user turn) deliberately OVERWRITES any previous value, because a stale
                 // span from another request would score the wrong tokens -- the exact failure class this
                 // whole instrument exists to remove.
-                ops::detail::kvmem_score_set_query_span(staged.prompt.query_span_begin,
+                // B06: publish to THIS sequence's lane. A process-global span meant a concurrent
+                // prefill on another lane overwrote it between this publish and the chunk's scoring,
+                // so one sequence's chunk could be scored against another sequence's question.
+                ops::detail::kvmem_score_set_query_span(sequence.lane, staged.prompt.query_span_begin,
                                                         staged.prompt.query_span_end);
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
@@ -1457,7 +1467,17 @@ namespace ninfer::models::qwen3_5 {
 // frontend/prepared_prompt.h. It lives here because this TU already includes ops/kvmem/kvmem_score.h
 // (the frontend must not grow a CUDA/ops include just to reach the scorer).
 void kvmem_publish_query_span(std::int32_t begin, std::int32_t end) noexcept {
-    ops::detail::kvmem_score_set_query_span(begin, end);
+    // B06: BROADCAST. The frontend runs in the request path, before any lane exists -- a lane is only
+    // assigned at commit time (commit.cpp:119) -- so it cannot publish to one lane. The span belongs
+    // to the REQUEST, and every lane that prefills this request has to see it. Two concurrent
+    // requests can still race here exactly as they raced on the old single global slot; the
+    // difference is that the driver republishes the correct per-lane span before each chunk
+    // (prefill.cpp:1206) for every path that runs chunks. The broadcast is what covers the shapes
+    // that run none -- the forced-token suffix prefill in transactions/commit.cpp, which bypasses
+    // the driver loop entirely (measured stale-span failure, 2026-10-02).
+    for (std::uint32_t lane = 0; lane < ninfer::kMaximumConcurrency; ++lane) {
+        ops::detail::kvmem_score_set_query_span(lane, begin, end);
+    }
 }
 
 } // namespace ninfer::models::qwen3_5

@@ -360,7 +360,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
                                              dimension(config_.attention->num_key_value_heads), T});
 
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
-    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
+    text_qk_norm_rope(kvmem_lane_, rope_for_op, *config_.rope_parameters, *config_.attention,
                       config_.rms_norm_eps, mtp_->query_norm, mtp_->key_norm, q, k, qn, kn,
                       rope_yarn_, s);
 
@@ -943,9 +943,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     // the component throws on that mismatch by design, and the engine turned it into a worker crash
     // (HTTP 500 on turn 2, measured 2026-10-02). Pass nullptr for every other phase so the static hook
     // state can never leak into a pass it does not describe.
-    execution::text_set_kvmem_hook(fidx, T, ph == Phase::Prefill ? kvmem_harvest_ : nullptr);
+    execution::text_set_kvmem_hook(kvmem_lane_, fidx, T,
+                                   ph == Phase::Prefill ? kvmem_harvest_ : nullptr);
     kvmem_round_width_ = T;   // what the round really scored, for the tail-side oracle log
-    text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
+    text_qk_norm_rope(kvmem_lane_, rope_for_op, *config_.rope_parameters, *config_.attention,
                       config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_,
                       s);
 
@@ -1792,7 +1793,7 @@ void TextContext::kvmem_round_begin() {
     // -- can be intersected with THIS chunk inside the scorer. Set unconditionally and before the
     // arming path: it is the intersection that needs it, and -1 (unknown) is what makes the scorer fall
     // back to its tail rule.
-    ops::detail::kvmem_score_set_chunk_origin(static_cast<std::int32_t>(text_kv_base_));
+    ops::detail::kvmem_score_set_chunk_origin(kvmem_lane_, static_cast<std::int32_t>(text_kv_base_));
     if (batch_text_kv_ == nullptr) { return; }
     const std::int32_t layers =
         static_cast<std::int32_t>(batch_text_kv_->layers());   // full-attention layers only
@@ -1802,15 +1803,17 @@ void TextContext::kvmem_round_begin() {
     const std::int32_t capacity_blocks = static_cast<std::int32_t>(
         batch_text_kv_->max_context() / static_cast<std::uint32_t>(kPagedKVPageSize));
     ops::RawKShadowHarvest* harvest =
-        ops::raw_k_shadow_harvest_for(prefill_chunk_, head_dim * kv_heads, layers);
+        ops::raw_k_shadow_harvest_for(kvmem_lane_, prefill_chunk_, head_dim * kv_heads, layers);
     if (harvest == nullptr) { return; }
     harvest->begin_round();
     harvest->set_round_origin(static_cast<std::int32_t>(text_kv_base_));
     kvmem_harvest_ = harvest;
-    ops::MeanKIndex* index = ops::mean_k_index_for(layers, kv_heads, head_dim, capacity_blocks);
+    ops::MeanKIndex* index =
+        ops::mean_k_index_for(kvmem_lane_, layers, kv_heads, head_dim, capacity_blocks);
     if (index == nullptr) { return; }
-    ops::detail::kvmem_score_begin(capacity_blocks, index->blocks_written(), index->tail_fill(),
-                                   static_cast<std::int32_t>(kPagedKVPageSize), layers,
+    ops::detail::kvmem_score_begin(kvmem_lane_, capacity_blocks, index->blocks_written(),
+                             index->tail_fill(),
+                             static_cast<std::int32_t>(kPagedKVPageSize), layers,
                                    static_cast<std::int32_t>(
                                        dimension(config_.attention->num_attention_heads)),
                                    kv_heads, head_dim, ctx_.stream);
@@ -1832,21 +1835,24 @@ void TextContext::kvmem_round_end() {
     const std::int32_t head_dim = static_cast<std::int32_t>(dimension(config_.attention->head_dim));
     const std::int32_t capacity_blocks = static_cast<std::int32_t>(
         batch_text_kv_->max_context() / static_cast<std::uint32_t>(kPagedKVPageSize));
-    ops::MeanKIndex* index = ops::mean_k_index_for(layers, kv_heads, head_dim, capacity_blocks);
+    ops::MeanKIndex* index =
+        ops::mean_k_index_for(kvmem_lane_, layers, kv_heads, head_dim, capacity_blocks);
     if (index != nullptr) {
         const std::int32_t round_first_block =
             static_cast<std::int32_t>(text_kv_base_ / static_cast<std::uint32_t>(kPagedKVPageSize));
         index->append_round(*harvest, round_first_block, ctx_.stream);
         // B08: hand this round's per-layer coverage to the scorer, so "layer 0 is in the index" shows
         // up as a reading on the SELECT line instead of being something to assume.
-        ops::detail::kvmem_score_set_harvest_layers(harvest->layers_harvested(), harvest->layers());
+        ops::detail::kvmem_score_set_harvest_layers(kvmem_lane_, harvest->layers_harvested(),
+                                                  harvest->layers());
     }
     // D2H + sync + selection, at the chunk tail and outside any capture (the glue's own contract).
-    ops::detail::kvmem_score_finish("text_prefill_chunk", kvmem_round_width_, ctx_.stream);
+    ops::detail::kvmem_score_finish(kvmem_lane_, "text_prefill_chunk", kvmem_round_width_,
+                                     ctx_.stream);
     // Clear the process-wide hook state as well: this card is done with the round, and the static in
     // attention.cpp must not describe a round that no longer exists (a later pass would otherwise see
     // a stale armed width -- the mismatch that crashed the worker on turn 2, 2026-10-02).
-    execution::text_set_kvmem_hook(-1, 0, nullptr);
+    execution::text_set_kvmem_hook(kvmem_lane_, -1, 0, nullptr);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

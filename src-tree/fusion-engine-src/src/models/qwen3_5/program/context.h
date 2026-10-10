@@ -61,6 +61,12 @@ struct PrefillContext {
     std::int32_t state_destination_slot                     = 0;
     std::uint32_t mtp_proposal_extent                       = 0;
     const qwen3_5::DFlashDecodeIngress* dflash_host_ingress = nullptr;
+    // B06: the sequence's execution lane (SequenceState::lane). Every KVMem object a prefill chunk
+    // touches is indexed by it, so a concurrent prefill on another lane cannot write into this
+    // round's harvest, index, probe, or norm/rope hook. Defaults to 0, which is the whole of the
+    // single-sequence arm -- the causal-score prefill (program_impl.cpp) has no sequence and is
+    // mutually exclusive with generation, so 0 is correct there rather than merely safe.
+    std::uint32_t lane = 0;
     // Pinned host destination for the logits behind the first generated token, or null.
     void* first_token_logits = nullptr;
     // Per-model-layer events of a Host restore still landing: the chunk's first pass over the

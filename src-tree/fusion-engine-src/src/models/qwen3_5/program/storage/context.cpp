@@ -1731,9 +1731,13 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
     // with NINFER_TERNARY_KVMEM_SCORE unset nothing is published, this block is skipped, and the
     // engine must reproduce the old readings exactly (the disjoint arm goes back to its pre-fix 4/6).
     {
-        const std::vector<std::int32_t>& kept = ops::detail::kvmem_score_selected_blocks();
-        const std::vector<float>& scores     = ops::detail::kvmem_score_host_scores();
-        const std::int32_t scored            = ops::detail::kvmem_score_scored_blocks();
+        // B06: read THIS sequence's probe. The probe is per-lane because it is written by this
+        // sequence's own prefill round and read back here for the same sequence; a process-global
+        // probe let a concurrent prefill on another lane overwrite the ranking between the two.
+        const std::vector<std::int32_t>& kept =
+            ops::detail::kvmem_score_selected_blocks(sequence.lane);
+        const std::vector<float>& scores = ops::detail::kvmem_score_host_scores(sequence.lane);
+        const std::int32_t scored = ops::detail::kvmem_score_scored_blocks(sequence.lane);
         if (!kept.empty() && scored > 0 && !scores.empty()) {
             std::vector<std::pair<float, std::uint32_t>> ranked;
             ranked.reserve(kept.size());

@@ -1274,28 +1274,19 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
         throw std::invalid_argument(
             "NINFER_KV_WINDOW (KVMem ring) requires --max-concurrency 1");
     }
-    // B06 (2026-10-04): the mean-K index is ONE process-wide slot, registered as a known limitation by
-    // the component itself (mean_k_index.h:248-251): "one index for the whole process means two
-    // concurrent sequences share it. V1 drives a single sequence... before --max-concurrency > 1 is used
-    // with KVMem on, this must become one index per lane and the arena account must grow by
-    // N x mean_k_index_bytes(layers, blocks, kv_heads, head_dim)".
-    // The guard above only covers the RING configuration. The scorer can also be switched on with the
-    // ring OFF (an explicit NINFER_TERNARY_KVMEM=1 and no NINFER_KV_WINDOW), and that configuration was
-    // reachable with --max-concurrency > 1: two lanes then share the index -- and the raw-K harvest,
-    // which is gated by the same switch -- so one sequence's KEPT set can be another sequence's blocks.
-    // A silent wrong retrieval is the one class of defect this project refuses to ship, so refuse the
-    // combination loudly and name both ways out. Making the index per-lane is a component change (one
-    // index per lane + the arena account xN), not a flag; until that exists, this combination is the
-    // boundary, not a tuning knob.
-    if (inputs.max_concurrency > 1 && ops::detail::kvmem_shadow_enabled()) {
-        std::fprintf(stderr,
-                     "[kvmem] the KVMem content scorer keeps ONE mean-K index (and one raw-K harvest) for "
-                     "the whole process, so two active sequences would rank each other's blocks "
-                     "(mean_k_index.h:248-251).\n"
-                     "       Run with --max-concurrency 1, or switch the scorer off "
-                     "(NINFER_TERNARY_KVMEM=0).\n");
-        throw std::invalid_argument("KVMem content scoring requires --max-concurrency 1");
-    }
+    // B06 (RESOLVED 2026-10-10): this guard is gone because the limitation it refused is no longer
+    // reachable. Every KVMem object the scorer writes was a process-wide slot that two lanes shared --
+    // the mean-K index, the raw-K harvest, the score probe, and the norm/rope hook -- so one sequence's
+    // KEPT set could be ranked by another sequence's question. All four are now per-lane, keyed by
+    // SequenceState::lane (mean_k_index_for(lane, ...), raw_k_shadow_harvest_for(lane, ...),
+    // kvmem_score_*(lane, ...), text_set_kvmem_hook(lane, ...)). The RING guard above stays: the ring is
+    // a separate component with its own single-actor reclamation limit, and B06 did not change it.
+    //
+    // The known-limitation note this guard pointed at (mean_k_index.h:248-251) carried the second half
+    // of the requirement: the arena account must grow by N x mean_k_index_bytes(...). At the shipped
+    // geometry (16 full-attention layers, 4 KV heads, head_dim 256) that is 65600 bytes per block per
+    // lane, so --max-concurrency 8 at a 65536-token context costs ~8x the index memory of lane 0. Size
+    // the Host budget for max_concurrency, not 1, before scaling past 4 lanes.
     if (impl->context_cache.enabled && impl->context_cache.mode == ContextCacheMode::Hybrid) {
         if (ring_requested()) {
             // LOCAL PROTOTYPE (KVMem-style ring): this branch zeroes the Host KV budget below, so

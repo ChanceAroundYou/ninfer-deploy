@@ -324,30 +324,41 @@ bool RawKShadowHarvest::dump_to_file(const char* path, const void* post_rope_lay
 //
 // Reads the switch, so the default (OFF) arm allocates nothing and returns nullptr; every install
 // site then stores a null pointer, which is what leaves the mixer with nothing to copy into.
-RawKShadowHarvest* raw_k_shadow_harvest_for(std::uint32_t prefill_chunk, std::int32_t kv_size,
-                                            std::int32_t layers) {
+RawKShadowHarvest* raw_k_shadow_harvest_for(std::uint32_t lane, std::uint32_t prefill_chunk,
+                                            std::int32_t kv_size, std::int32_t layers) {
     if (!detail::kvmem_shadow_enabled()) { return nullptr; }
-    static RawKShadowHarvest* harvest = nullptr;
-    static std::uint32_t sized_for    = 0;
+    // B06: one harvest per lane. The staging slots hold the PRE-RoPE keys of the round in progress,
+    // so a shared harvest would have two concurrent prefills copying into the same device slots --
+    // the mean-K index would then be fed another sequence's keys. See mean_k_index_for for the lane
+    // contract; the check is identical and deliberately loud.
+    if (lane >= ninfer::kMaximumConcurrency) {
+        throw std::invalid_argument(std::string(kSubject) + ": lane " + std::to_string(lane) +
+                                    " is outside [0," + std::to_string(ninfer::kMaximumConcurrency) +
+                                    ")");
+    }
+    static std::array<RawKShadowHarvest*, ninfer::kMaximumConcurrency> harvest{};
+    static std::array<std::uint32_t, ninfer::kMaximumConcurrency> sized_for{};
+    RawKShadowHarvest*& slot    = harvest[lane];
+    std::uint32_t& lane_sized   = sized_for[lane];
     const std::int32_t tokens =
         (prefill_chunk == 0) ? 1 : static_cast<std::int32_t>(prefill_chunk);
-    if (harvest == nullptr) {
-        harvest   = new RawKShadowHarvest(layers, kv_size, tokens);
-        sized_for = prefill_chunk;
+    if (slot == nullptr) {
+        slot         = new RawKShadowHarvest(layers, kv_size, tokens);
+        lane_sized   = prefill_chunk;
         std::fprintf(stderr,
-                     "raw_k_shadow: harvest installed layers=%d kv_size=%d tokens=%d (%.1f MiB "
+                     "raw_k_shadow: harvest installed lane=%u layers=%d kv_size=%d tokens=%d (%.1f MiB "
                      "device, same pinned)\n",
-                     layers, kv_size, tokens,
+                     static_cast<unsigned>(lane), layers, kv_size, tokens,
                      static_cast<double>(layers) * kv_size * tokens * 2 / (1024.0 * 1024.0));
-        return harvest;
+        return slot;
     }
-    if (prefill_chunk > sized_for) {
+    if (prefill_chunk > lane_sized) {
         // Silently reusing an undersized harvest would make raw_k_shadow_copy throw mid-prefill;
         // silently reallocating would move device addresses a captured graph already points at.
         throw std::logic_error(std::string(kSubject) +
                                ": harvest was sized for a smaller prefill chunk");
     }
-    return harvest;
+    return slot;
 }
 
 } // namespace ninfer::ops

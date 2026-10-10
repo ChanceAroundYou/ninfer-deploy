@@ -39,6 +39,9 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ops/kvmem/raw_k_shadow.h"
+
+// B06: the per-lane slot count for the harvest and the mean-K index alike.
+#include <ninfer/types.h>
 // 装配臂（expmem-arm）"路 1"：按块留存 raw-K 的 arena。放在这里 include，是为了让**每一个认识
 // harvest 的 TU**（raw_k_harvest.cpp / text_prefill_impl.h / program_impl.h 链路）都同时看到 arena
 // 定义——否则"重烘该从哪取料"会有一半 TU 看不见。
@@ -235,7 +238,12 @@ private:
 //
 // Reads the switch. Returns nullptr when NINFER_TERNARY_KVMEM is off, which is the default, so the
 // OFF arm allocates nothing and every install site reduces to storing a null pointer.
-[[nodiscard]] RawKShadowHarvest* raw_k_shadow_harvest_for(std::uint32_t prefill_chunk,
+//
+// B06: `lane` is the SequenceState::lane the prefill runs on (stable for the sequence's lifetime).
+// One harvest per lane, because the staging slots hold the round in progress -- see the .cpp for the
+// full argument and the bounds check.
+[[nodiscard]] RawKShadowHarvest* raw_k_shadow_harvest_for(std::uint32_t lane,
+                                                          std::uint32_t prefill_chunk,
                                                           std::int32_t kv_size,
                                                           std::int32_t layers);
 

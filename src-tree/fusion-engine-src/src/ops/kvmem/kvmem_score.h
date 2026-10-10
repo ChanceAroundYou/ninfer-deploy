@@ -25,8 +25,9 @@
 //      `qn`（RMS 归一化后、`ops::rope` 覆盖之前）。这就是为什么 accumulate() 的调用点在 rope 之前。
 //
 // 【已知边界（写死在代码里，别当没看见）】
-//   * **多 lane 不安全**：mean-K 索引是**全进程一份**（mean_k_index.h:248-251 自陈），本探针的
-//     score 缓冲同样是全进程一份 ⇒ 只在单路（--max-concurrency 1）下有意义。多路时必须 per-lane。
+//   * **B06 已解除（2026-10-10）**：原先 mean-K 索引与本探针的 score 缓冲都是**全进程一份**
+//     ⇒ 多 lane 时两条路互相排名对方的 block。现已按 SequenceState::lane 分槽（索引、harvest、
+//     probe、rope hook 四者同 lane），lane 0 保持单路原样。
 //   * query span 的**分段**口径：≤ MAXQ（默认 256）的 span 一次内核调用打完；**更长的 span 从
 //     2026-10-04 起改为"取该 span 末尾 ≤ SCORE_SPAN_MAX（默认 4096）个 token、按 MAXQ 切段求和"**
 //     （B05：此前是整段跳过 ⇒ 该 chunk 一分不打 ⇒ KEPT 0 ⇒ 回落词法排序）。分段在数学上是正确的：
@@ -44,7 +45,11 @@
 #include "ops/kvmem/kvmem_select.h"
 #include "ops/kvmem/mean_k_index.h"
 
+// B06: the per-lane slot count for the probe array (kMaximumConcurrency).
+#include <ninfer/types.h>
+
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -152,29 +157,39 @@ struct KvMemScoreProbe {
     bool logged_span_segment = false;   // B05: 长 span 改为切段打分，只喊一次（它是"行为变了"的证据行）
 };
 
-inline KvMemScoreProbe& kvmem_score_probe() {
-    static KvMemScoreProbe probe;
-    return probe;
+// B06: one probe PER LANE. The probe carries the score buffer, the kept block set and the
+// query-span state, so a process-wide probe let one sequence's decode read another sequence's
+// ranking -- the silent wrong retrieval this whole instrument exists to remove. `lane` is the
+// SequenceState::lane the request was admitted on; it is stable for the sequence's lifetime.
+//
+// Lane 0 is byte-for-byte the old single probe, so --max-concurrency 1 is unchanged.
+//
+// No bounds check here, unlike mean_k_index_for: this accessor is on noexcept paths, and the lane is
+// already provably in range -- startup.cpp:1024 throws unless max_concurrency <= kMaximumConcurrency,
+// and every lane is drawn from that same bounded pool. The array is sized by that same constant.
+inline KvMemScoreProbe& kvmem_score_probe(std::uint32_t lane) {
+    static std::array<KvMemScoreProbe, ninfer::kMaximumConcurrency> probes;
+    return probes[lane];
 }
 
 // LOCAL (2026-10-02, the caller step): the block ids selected by the most recent kvmem_score_finish().
 // ASCENDING (kvmem_select.h:30-33 -- never score order). Empty = no fresh selection, see the note on
 // KvMemScoreProbe::kept. Read by ProgramImpl::select_retrieval_pages as the ring's `preferred` set.
-inline const std::vector<std::int32_t>& kvmem_score_selected_blocks() noexcept {
-    return kvmem_score_probe().kept;
+inline const std::vector<std::int32_t>& kvmem_score_selected_blocks(std::uint32_t lane) noexcept {
+    return kvmem_score_probe(lane).kept;
 }
 
 // The per-block scores behind that selection: index i is the score of block i (first_block is 0 at our
 // single call site). Published because the ring's restore budget is SMALLER than the selector's
 // default budget, so the caller has to rank the kept set again and take its top `budget` -- truncating
 // the ascending id list would silently keep the OLDEST blocks instead of the best ones.
-inline const std::vector<float>& kvmem_score_host_scores() noexcept {
-    return kvmem_score_probe().score_host;
+inline const std::vector<float>& kvmem_score_host_scores(std::uint32_t lane) noexcept {
+    return kvmem_score_probe(lane).score_host;
 }
 
 // How many blocks the published scores describe ([0, n)). Zero = nothing to read.
-inline std::int32_t kvmem_score_scored_blocks() noexcept {
-    return kvmem_score_probe().scored_n_blocks;
+inline std::int32_t kvmem_score_scored_blocks(std::uint32_t lane) noexcept {
+    return kvmem_score_probe(lane).scored_n_blocks;
 }
 
 // ---- ①b 绝对 query span（D-12, 2026-10-02）------------------------------------------------------
@@ -184,31 +199,33 @@ inline std::int32_t kvmem_score_scored_blocks() noexcept {
 // （服务层口径：取最后一轮 role=user）"）。frontend 在准备 prompt 时把该轮的 token 区间（**绝对下标**）
 // 交到这里，打分时再与当前 chunk 求交 —— 这就是那份"两步"的落地，不再靠"尾 N token"去猜问句在哪。
 //
-// 与整个探针一样，这份状态是**进程级**的 ⇒ 只在 --max-concurrency 1 下有意义（多路必须 per-lane）。
+// B06：这份状态与探针同 lane（SequenceState::lane），不再进程级。
 // B08：本轮索引的逐层覆盖读数 —— `MeanKIndex::append_round` 只喂"本轮真被写过的层"，这里把它的计数
 // 送到 SELECT 行（`harvest_layers=K/L`）。K == L 即"层 0 也在索引里"；K < L 时 append_round 另有一行
 // 说明跳过的是哪些层、以及为什么（那些槽里还是上一轮的字节）。
-inline void kvmem_score_set_harvest_layers(std::int32_t harvested, std::int32_t total) noexcept {
-    KvMemScoreProbe& p     = kvmem_score_probe();
+inline void kvmem_score_set_harvest_layers(std::uint32_t lane, std::int32_t harvested,
+                                            std::int32_t total) noexcept {
+    KvMemScoreProbe& p     = kvmem_score_probe(lane);
     p.harvest_layers       = harvested;
     p.harvest_layers_total = total;
 }
 
 // begin < 0 = 未知 ⇒ 回落 QUERY_TAIL 尾窗规则：那既是既有行为，也是这条改动的**负控**。
-inline void kvmem_score_set_query_span(std::int32_t begin, std::int32_t end) noexcept {
-    KvMemScoreProbe& p = kvmem_score_probe();
+inline void kvmem_score_set_query_span(std::uint32_t lane, std::int32_t begin,
+                                       std::int32_t end) noexcept {
+    KvMemScoreProbe& p = kvmem_score_probe(lane);
     p.abs_query_begin = begin;
     p.abs_query_end   = end;
 }
 
 // 本 chunk 的**绝对** token 起点（= 该序列此刻已写入 KV 的 token 数，即 text_kv_base）。只有它已知，
 // 绝对 span 才能落到 chunk 内的局部下标上；未知则同样回落尾窗。
-inline void kvmem_score_set_chunk_origin(std::int32_t abs_begin) noexcept {
-    kvmem_score_probe().abs_chunk_begin = abs_begin;
+inline void kvmem_score_set_chunk_origin(std::uint32_t lane, std::int32_t abs_begin) noexcept {
+    kvmem_score_probe(lane).abs_chunk_begin = abs_begin;
 }
 
-inline void kvmem_score_fail(const char* why) noexcept {
-    KvMemScoreProbe& p = kvmem_score_probe();
+inline void kvmem_score_fail(std::uint32_t lane, const char* why) noexcept {
+    KvMemScoreProbe& p = kvmem_score_probe(lane);
     p.failed = true;
     p.armed  = false;
     std::fprintf(stderr, "kvmem_score: DISABLED (%s)\n", why);
@@ -218,13 +235,13 @@ inline void kvmem_score_fail(const char* why) noexcept {
 //
 // history_blocks 取**打分开始那一刻**的 blocks_written()：本 chunk 自己还没进索引（索引在 chunk
 // 之后才 append_round），所以它天然是"历史"——这正是检索该对的东西。
-inline void kvmem_score_begin(std::int32_t requested_capacity, std::int32_t history_blocks,
-                              std::int32_t tail_fill, std::int32_t block_tokens,
-                              std::int32_t layers_total, std::int32_t n_heads,
-                              std::int32_t n_kv_heads, std::int32_t head_dim,
-                              cudaStream_t stream) noexcept {
+inline void kvmem_score_begin(std::uint32_t lane, std::int32_t requested_capacity,
+                              std::int32_t history_blocks, std::int32_t tail_fill,
+                              std::int32_t block_tokens, std::int32_t layers_total,
+                              std::int32_t n_heads, std::int32_t n_kv_heads,
+                              std::int32_t head_dim, cudaStream_t stream) noexcept {
     if (!kvmem_score_enabled()) { return; }
-    KvMemScoreProbe& p = kvmem_score_probe();
+    KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (p.failed) { return; }
 
     // LOCAL (D-12, 2026-10-02): a round that ends up NOT scoring -- because its chunk does not contain
@@ -252,7 +269,7 @@ inline void kvmem_score_begin(std::int32_t requested_capacity, std::int32_t hist
             cudaMalloc(reinterpret_cast<void**>(&p.block_tokens_dev),
                        static_cast<std::size_t>(requested_capacity) * sizeof(std::int32_t)) !=
                 cudaSuccess) {
-            kvmem_score_fail("cudaMalloc");
+            kvmem_score_fail(lane, "cudaMalloc");
             return;
         }
         p.capacity_blocks = requested_capacity;
@@ -280,12 +297,12 @@ inline void kvmem_score_begin(std::int32_t requested_capacity, std::int32_t hist
     if (cudaMemcpyAsync(p.block_tokens_dev, p.tokens_host.data(),
                         static_cast<std::size_t>(history_blocks) * sizeof(std::int32_t),
                         cudaMemcpyHostToDevice, stream) != cudaSuccess) {
-        kvmem_score_fail("block_tokens H2D");
+        kvmem_score_fail(lane, "block_tokens H2D");
         return;
     }
     if (cudaMemsetAsync(p.score, 0, static_cast<std::size_t>(history_blocks) * sizeof(float), stream) !=
         cudaSuccess) {
-        kvmem_score_fail("score memset");
+        kvmem_score_fail(lane, "score memset");
         return;
     }
 }
@@ -293,10 +310,11 @@ inline void kvmem_score_begin(std::int32_t requested_capacity, std::int32_t hist
 // ---- ② 每层一次：把该层的 query 行累加到 score 上 ----------------------------------------------
 //
 // 调用点必须在 `ops::rope(qn, ...)` **之前**：rope 会原地覆盖 qn，之后就没有内容帧的 query 了。
-inline void kvmem_score_accumulate(std::int32_t fidx, const void* q, std::int32_t n_query_tokens,
-                                   std::int32_t chunk_tokens, cudaStream_t stream) noexcept {
+inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const void* q,
+                                   std::int32_t n_query_tokens, std::int32_t chunk_tokens,
+                                   cudaStream_t stream) noexcept {
     if (!kvmem_score_enabled()) { return; }
-    KvMemScoreProbe& p = kvmem_score_probe();
+    KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (!p.armed || p.failed) { return; }
     if (n_query_tokens <= 0 || p.n_blocks <= 0) { return; }
 
@@ -412,8 +430,8 @@ inline void kvmem_score_accumulate(std::int32_t fidx, const void* q, std::int32_
     p.query_span_begin  = span_begin;
     p.query_span_tokens = span_tokens;    // 供 finish 的 oracle 自检用（正确口径 = 真正打分的 token 数）
 
-    ops::MeanKIndex* index = ops::mean_k_index_for(p.layers_total, p.n_kv_heads, p.head_dim,
-                                                  p.capacity_blocks);
+    ops::MeanKIndex* index = ops::mean_k_index_for(lane, p.layers_total, p.n_kv_heads,
+                                                  p.head_dim, p.capacity_blocks);
     if (index == nullptr || index->blocks_written() <= 0) { return; }
     if (fidx < 0 || fidx >= index->layers()) { return; }
 
@@ -448,7 +466,7 @@ inline void kvmem_score_accumulate(std::int32_t fidx, const void* q, std::int32_
         if (status != cudaSuccess) {
             std::fprintf(stderr, "kvmem_score: launch failed layer=%d: %s\n", fidx,
                          cudaGetErrorString(status));
-            kvmem_score_fail("launch");
+            kvmem_score_fail(lane, "launch");
             return;
         }
     }
@@ -462,10 +480,10 @@ inline void kvmem_score_accumulate(std::int32_t fidx, const void* q, std::int32_
 //
 // 免 oracle 自检：契约保证 `sum_b score[b] == n_query_tokens`（与带掩码与否无关）⇒ sum_score 就是
 // 内置 oracle。对不上说明打分器没跑、跑了半截、或几何配错 —— 三种都得当场喊出来。
-inline void kvmem_score_finish(const char* label, std::int32_t query_tokens,
-                               cudaStream_t stream) noexcept {
+inline void kvmem_score_finish(std::uint32_t lane, const char* label,
+                               std::int32_t query_tokens, cudaStream_t stream) noexcept {
     if (!kvmem_score_enabled()) { return; }
-    KvMemScoreProbe& p = kvmem_score_probe();
+    KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (!p.armed || p.failed || p.n_blocks <= 0) { return; }
     p.armed = false;
     if (!p.scored_this_chunk) { return; }   // 本 chunk 没打过（如长 ingest）⇒ 不打印全零假日志
@@ -487,11 +505,11 @@ inline void kvmem_score_finish(const char* label, std::int32_t query_tokens,
     const std::size_t bytes = static_cast<std::size_t>(p.n_blocks) * sizeof(float);
     if (cudaMemcpyAsync(p.score_host.data(), p.score, bytes, cudaMemcpyDeviceToHost, stream) !=
         cudaSuccess) {
-        kvmem_score_fail("score D2H");
+        kvmem_score_fail(lane, "score D2H");
         return;
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
-        kvmem_score_fail("sync");
+        kvmem_score_fail(lane, "sync");
         return;
     }
 
@@ -547,11 +565,11 @@ inline void kvmem_score_finish(const char* label, std::int32_t query_tokens,
 }
 
 // 逐块分数导出（给离线判据用：核对"含针的块"有没有被选中）。只在 switch 打开且本 chunk 打过时写。
-inline void kvmem_score_dump_if_requested(const char* label) noexcept {
+inline void kvmem_score_dump_if_requested(std::uint32_t lane, const char* label) noexcept {
     if (!kvmem_score_enabled()) { return; }
     const char* path = std::getenv("NINFER_TERNARY_KVMEM_SCORE_DUMP");
     if (path == nullptr || path[0] == '\0') { return; }
-    KvMemScoreProbe& p = kvmem_score_probe();
+    KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (p.n_blocks <= 0) { return; }
     FILE* f = std::fopen(path, "ab");
     if (f == nullptr) { return; }

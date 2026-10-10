@@ -10,6 +10,7 @@
 #include "ops/kvmem/mean_k_index_launch.h"
 
 #include <algorithm>
+#include <array>
 #include <stdexcept>
 #include <string>
 
@@ -237,17 +238,28 @@ void MeanKIndex::append_one(const void* raw_key_bf16, std::int32_t layer_index,
     tail_fill_      = tail_fill;
 }
 
-MeanKIndex* mean_k_index_for(std::int32_t layers, std::int32_t heads, std::int32_t head_dim,
-                             std::int32_t capacity_blocks) {
+MeanKIndex* mean_k_index_for(std::uint32_t lane, std::int32_t layers, std::int32_t heads,
+                             std::int32_t head_dim, std::int32_t capacity_blocks) {
     // Read the switch in the DRIVER, like the harvest does (kvmem_shadow.h:55-61): the OFF arm must
     // allocate nothing and issue nothing. A null return is the normal "KVMem is off" answer, never an
     // error, and callers gate on it.
     if (!detail::kvmem_shadow_enabled()) { return nullptr; }
     if (layers <= 0 || heads <= 0 || head_dim <= 0 || capacity_blocks <= 0) { return nullptr; }
+    // B06: bounds-check the lane rather than clamping it. Clamping would hand two sequences the SAME
+    // index -- exactly the silent cross-sequence ranking B06 exists to remove, and it would do it
+    // quietly. Throwing keeps a caller bug visible instead of letting it become a wrong answer.
+    if (lane >= ninfer::kMaximumConcurrency) {
+        throw std::invalid_argument(std::string(kSubject) + ": lane " + std::to_string(lane) +
+                                    " is outside [0," + std::to_string(ninfer::kMaximumConcurrency) +
+                                    ")");
+    }
 
-    static MeanKIndex* installed = nullptr;
-    if (installed == nullptr) {
-        installed = new MeanKIndex(layers, heads, head_dim, capacity_blocks);
+    // B06: one index per lane. Lane 0 keeps the exact pre-B06 object, so the --max-concurrency 1
+    // deployment this engine has been measured on is byte-for-byte unchanged.
+    static std::array<MeanKIndex*, ninfer::kMaximumConcurrency> installed{};
+    MeanKIndex*& slot = installed[lane];
+    if (slot == nullptr) {
+        slot = new MeanKIndex(layers, heads, head_dim, capacity_blocks);
         // REQUIRED before the first append: arena bytes are not guaranteed zero, and the accumulate
         // kernel ADDS into the destination, so an unwritten block would otherwise start from
         // garbage and its count would claim tokens it never saw.
@@ -257,24 +269,25 @@ MeanKIndex* mean_k_index_for(std::int32_t layers, std::int32_t heads, std::int32
         // allocation. Leaving it async would put a memset in front of the first append on a stream
         // whose ordering the caller does not control, and a silently-lost zero would corrupt the
         // index in the one way that is hardest to attribute (a wrong ranking, much later).
-        const cudaError_t zero_status = installed->zero(nullptr);
+        const cudaError_t zero_status = slot->zero(nullptr);
         std::fprintf(stderr,
-                     "kvmem_index: installed layers=%d heads=%d head_dim=%d blocks=%d "
+                     "kvmem_index: installed lane=%u layers=%d heads=%d head_dim=%d blocks=%d "
                      "bytes=%.1f MiB zero=%s\n",
-                     static_cast<int>(layers), static_cast<int>(heads),
+                     static_cast<unsigned>(lane), static_cast<int>(layers), static_cast<int>(heads),
                      static_cast<int>(head_dim), static_cast<int>(capacity_blocks),
-                     static_cast<double>(installed->bytes_total()) / (1024.0 * 1024.0),
+                     static_cast<double>(slot->bytes_total()) / (1024.0 * 1024.0),
                      cudaGetErrorName(zero_status));
         if (zero_status != cudaSuccess) {
             // Fail loudly instead of handing back an index whose counts are noise: a bad count is not
-            // detectable downstream, it just moves the ranking.
-            delete installed;
-            installed = nullptr;
+            // detectable downstream, it just moves the ranking. Clearing THIS lane's slot keeps a
+            // retry from being handed the half-initialised index.
+            delete slot;
+            slot = nullptr;
             throw std::runtime_error(std::string(kSubject) + ": zero() failed: " +
                                      cudaGetErrorName(zero_status));
         }
     }
-    return installed;
+    return slot;
 }
 
 } // namespace ninfer::ops

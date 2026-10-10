@@ -95,6 +95,11 @@
 #include "core/tensor.h"
 #include "ops/kvmem/raw_k_harvest.h"
 
+// B06: the per-lane slot count comes from the one public definition rather than being repeated
+// here, so raising kMaximumConcurrency cannot leave a smaller array behind (the same discipline as
+// mean_k_index.cpp's kBlockTokens reading kPagedKVPageSize instead of typing 64).
+#include <ninfer/types.h>
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -245,13 +250,21 @@ private:
 //   before any append, because arena memory is not guaranteed zero and a non-zero count would let an
 //   unwritten block look indexed.
 //
-// KNOWN LIMITATION, REGISTERED: one index for the whole process means two concurrent sequences share
-//   it. V1 drives a single sequence, so this is correct today; before --max-concurrency > 1 is used
-//   with KVMem on, this must become one index per lane and the arena account must grow by
-//   N x mean_k_index_bytes(layers, blocks, kv_heads, head_dim).
+// B06 (RESOLVED 2026-10-10): the limitation this comment registered is gone. The index is now
+//   ONE PER LANE: `lane` is the SequenceState::lane the sequence was admitted on (commit.cpp:
+//   `sequence.lane = lane`), which is stable for the sequence's lifetime and bounded by
+//   kMaximumConcurrency, so two concurrent sequences can no longer rank each other's blocks. The
+//   arena account grows by N x mean_k_index_bytes(layers, blocks, kv_heads, head_dim); startup logs
+//   that total (planning/startup.cpp).
 //
-// `capacity_blocks` is honoured on the FIRST call only, and it fixes the allocation for the process.
-[[nodiscard]] MeanKIndex* mean_k_index_for(std::int32_t layers, std::int32_t heads,
-                                           std::int32_t head_dim, std::int32_t capacity_blocks);
+//   `lane` is validated, not clamped: an out-of-range lane is a caller bug and would otherwise write
+//   past the array, which is the one failure mode a shared array turns from "wrong ranking" into
+//   "corrupted address". The OFF arm still returns nullptr BEFORE the check, so the disabled
+//   feature allocates nothing and tolerates whatever the caller passes.
+//
+// `capacity_blocks` is honoured on the FIRST call FOR THAT LANE, and it fixes that lane's allocation.
+[[nodiscard]] MeanKIndex* mean_k_index_for(std::uint32_t lane, std::int32_t layers,
+                                           std::int32_t heads, std::int32_t head_dim,
+                                           std::int32_t capacity_blocks);
 
 } // namespace ninfer::ops
