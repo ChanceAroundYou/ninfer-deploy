@@ -30,7 +30,8 @@ constexpr std::string_view kCorsAllowedHeaders =
 // router owns paths the server has no file for.
 bool is_api_path(std::string_view path) {
     return path == "/v1" || path.starts_with("/v1/") || path == "/health" || path == "/metrics" ||
-           path == "/stats" || path == "/slots" || path == "/props" || path == kMcpProxyPath;
+           path == "/stats" || path == "/slots" || path == "/props" || path == kMcpProxyPath ||
+           path == "/v1/admin/cache/clear" || path.starts_with("/v1/admin/cache/clear/");
 }
 
 
@@ -588,6 +589,14 @@ void HttpServer::register_routes() {
                  [this](const httplib::Request& req, httplib::Response& res) {
                      handle_response_cancel(req, res);
                  });
+    server_.Post("/v1/admin/cache/clear",
+                 [this](const httplib::Request& req, httplib::Response& res) {
+                     handle_cache_clear(req, res);
+                 });
+    server_.Get(R"(/v1/admin/cache/clear/(.+))",
+                [this](const httplib::Request& req, httplib::Response& res) {
+                    handle_cache_clear_get(req, res);
+                });
     server_.Get(R"(/v1/responses/([^/]+)/input_items)",
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_response_input_items(req, res);

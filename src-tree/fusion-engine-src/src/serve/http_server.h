@@ -124,6 +124,8 @@ private:
     void handle_response_input_items(const httplib::Request& req, httplib::Response& res);
     void handle_response_cancel(const httplib::Request& req, httplib::Response& res);
     void handle_response_compact(const httplib::Request& req, httplib::Response& res);
+    void handle_cache_clear(const httplib::Request& req, httplib::Response& res);
+    void handle_cache_clear_get(const httplib::Request& req, httplib::Response& res);
     void handle_load(const httplib::Request& req, httplib::Response& res) const;
     void handle_metrics(const httplib::Request& req, httplib::Response& res) const;
     void handle_stats(const httplib::Request& req, httplib::Response& res) const;

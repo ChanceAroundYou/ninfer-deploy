@@ -151,6 +151,20 @@ public:
 
     [[nodiscard]] bool is_available() const { return engine_->is_available(); }
 
+    [[nodiscard]] std::uint64_t submit_cache_clear(std::uint32_t scope_mask, std::uint8_t mode,
+                                                   bool dry_run, std::string requested_by) {
+        ninfer::Engine::CacheClearRequest req;
+        req.scope_mask = scope_mask;
+        req.mode = mode;
+        req.dry_run = dry_run;
+        req.requested_by = std::move(requested_by);
+        return engine_->submit_cache_clear(req);
+    }
+    [[nodiscard]] bool cache_clear_status(std::uint64_t id,
+                                          ninfer::Engine::CacheClearStatus& out) const {
+        return engine_->cache_clear_status(id, out);
+    }
+
     // Requests currently holding ingress capacity (max_concurrency + max_pending_requests).
     [[nodiscard]] std::size_t admitted_requests() const;
     // The most requests that have held ingress capacity at once since startup.

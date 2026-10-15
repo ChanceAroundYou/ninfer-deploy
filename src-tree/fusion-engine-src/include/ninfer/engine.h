@@ -104,6 +104,30 @@ public:
                               OutputSink* sink                     = nullptr,
                               const CancellationView& cancellation = {});
 
+    // Online cache release (isolation v1). Submits an admin op to the worker and polls
+    // its terminal state. HTTP threads must use this, never the cache directly.
+    struct CacheClearRequest {
+        std::uint32_t scope_mask = 0x7Fu;  // CacheScope bits; 0x7F == All
+        std::uint8_t mode = 0;             // 0=try_idle 1=drain_and_fail 2=abort_and_clear
+        bool dry_run = false;
+        std::string requested_by;
+    };
+    struct CacheClearStatus {
+        std::uint64_t id = 0;
+        std::uint8_t state = 0;  // 0=queued 1=running 2=done 3=refused_busy 4=failed
+        std::string detail;
+        std::uint32_t in_flight = 0;
+        bool materializing = false;
+        bool has_transaction = false;
+        std::uint32_t failed_requests = 0;
+        std::uint64_t kv_tokens_before = 0;
+        std::uint64_t kv_tokens_after = 0;
+        std::uint64_t host_bytes_before = 0;
+        std::uint64_t host_bytes_after = 0;
+        std::uint64_t duration_ms = 0;
+    };
+    [[nodiscard]] std::uint64_t submit_cache_clear(const CacheClearRequest& req);
+    [[nodiscard]] bool cache_clear_status(std::uint64_t id, CacheClearStatus& out) const;
     [[nodiscard]] const EngineOptions& options() const;
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] ModelMetadata model_metadata() const;

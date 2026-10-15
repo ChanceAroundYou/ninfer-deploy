@@ -1455,6 +1455,11 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_snapshot_evictions = 0;
     std::uint64_t hybrid_host_dead_reclaims      = 0;
     std::uint64_t hybrid_unbacked_node_losses    = 0;
+
+    // Online cache release (admin ops): cumulative counters, published by the worker.
+    std::uint64_t cache_clear_total               = 0;
+    std::uint64_t cache_clear_refused_busy        = 0;
+    std::uint64_t cache_clear_failed_requests     = 0;
 };
 
 enum class ContextCostPresetSource : std::uint8_t {
