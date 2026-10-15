@@ -38,8 +38,8 @@ def cur_port():
 
 # ai 服务器上的路径
 MODEL_NINFER = '/home/ET/chenran/llm-deploy/models/swift-qwen38-q4km.ninfer'
-EXE_NINFER = '/home/ET/chenran/llm-deploy/build-ninfer-sm86-clean/apps/ninfer-serve'
-CWD_NINFER = '/home/ET/chenran/llm-deploy/build-ninfer-sm86-clean'
+EXE_NINFER = '/home/ET/chenran/llm-deploy/runtime/build-current/apps/ninfer-serve'
+CWD_NINFER = '/home/ET/chenran/llm-deploy/runtime/build-current'
 GPU_ID = '2'
 
 # 256K 满池配置（2026-10-09 实测定案）
