@@ -13,6 +13,10 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/cache_clear.h"
+#include "runtime/engine/scoped_release_stats.h"
+#include <cstdio>
+#include "runtime/engine/diagnostics.h"
 
 #include <algorithm>
 #include <array>
@@ -27,6 +31,7 @@
 #include <exception>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -200,6 +205,16 @@ public:
 
         friend class EngineCore;
     };
+
+    // ---- online cache release: public submission surface (HTTP threads call these only) --
+    [[nodiscard]] std::uint64_t submit_cache_clear(CacheScope scope, ClearMode mode, bool dry_run,
+                                                   std::string requested_by) {
+        return enqueue_cache_clear(scope, mode, dry_run, std::move(requested_by));
+    }
+    [[nodiscard]] bool cache_clear_status(std::uint64_t id, CacheClearResult& out) const {
+        return cache_clear_result(id, out);
+    }
+    [[nodiscard]] std::uint64_t cache_clear_submitted() const noexcept { return next_admin_id_ - 1; }
 
     Submission submit(PreparedPrompt prompt, PromptSummary prompt_summary, double prepare_seconds,
                       ResolvedRequestOptions options, OutputConsumerMode consumer_mode,
@@ -592,6 +607,9 @@ private:
             }
             if (!pending_.empty()) { last_queue_publication_ = now; }
         }
+        snapshot.cache_clear_total = cache_clear_total_;
+        snapshot.cache_clear_refused_busy = cache_clear_refused_busy_;
+        snapshot.cache_clear_failed_requests = cache_clear_failed_requests_total_;
         snapshot.prefilling_requests = 0;
         snapshot.materializing_requests = materializing_.has_value() ? 1U : 0U;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -2276,6 +2294,225 @@ private:
 
     // The worker holds execution_mutex_ across the failing operation and this cleanup, so no
     // Program introspection can observe a partially cleared physical state.
+    // ---- online cache release (isolation v1) -------------------------------------------
+    // Called from the worker boundary while holding execution_mutex_. Executes at most one
+    // queued admin op per boundary. Returns true when an op reached a terminal state.
+    // Preconditions are asserted here, never in the HTTP layer: TryIdle refuses on any
+    // in-flight lane / materializing request / pending item / live context transaction;
+    // DrainAndFail fails in-flight work as retryable Overloaded first; AbortAndClear reuses
+    // the fail_all_cleanup path (transaction abort + store rebuild) as a non-fault op.
+    bool service_admin_queue(HostPhaseMeasurement& boundary) noexcept {
+        CacheClearCmd cmd;
+        {
+            std::lock_guard lock(admin_mutex_);
+            if (admin_queue_.empty()) { return false; }
+            cmd = admin_queue_.front();
+            admin_queue_.pop_front();
+        }
+        const auto t0 = Clock::now();
+        CacheClearResult result;
+        result.id = cmd.id;
+        result.state = CacheClearState::Running;
+        std::uint32_t lanes_in_flight = 0;
+        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+            if (slots_[lane] != nullptr) { ++lanes_in_flight; }
+        }
+        bool materializing = materializing_.has_value();
+        bool has_txn = false;
+        try { has_txn = instance_.program->has_context_transaction(); } catch (...) {}
+        std::size_t pending_count = 0;
+        try {
+            std::lock_guard lock(queue_mutex_);
+            pending_count = pending_.size();
+        } catch (...) {}
+        result.in_flight = lanes_in_flight;
+        result.materializing = materializing;
+        result.has_transaction = has_txn;
+        std::uint64_t kv_before = 0, host_before = 0;
+        try {
+            const auto usage = instance_.program->physical_usage();
+            kv_before = static_cast<std::uint64_t>(usage.device_main_kv_pages) * 64;
+            host_before = static_cast<std::uint64_t>(usage.host_kv_bytes);
+        } catch (...) {}
+        result.kv_tokens_before = kv_before;
+        result.host_bytes_before = host_before;
+        const bool busy = (lanes_in_flight != 0) || materializing || (pending_count != 0) || has_txn;
+        auto publish = [&](CacheClearResult r) {
+            r.duration_ms = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - t0).count());
+            try {
+                std::lock_guard lock(admin_mutex_);
+                admin_results_[r.id] = r;
+                while (admin_results_.size() > kAdminResultsCap) {
+                    admin_results_.erase(admin_results_.begin());
+                }
+            } catch (...) {}
+        };
+        if (cmd.dry_run) {
+            result.state = CacheClearState::Done;
+            result.detail = busy ? "dry-run: would refuse (busy)" : "dry-run: would clear";
+            publish(result);
+            return true;
+        }
+        if (cmd.mode == ClearMode::TryIdle && busy) {
+            result.state = CacheClearState::RefusedBusy;
+            result.detail = "busy: lanes/materializing/pending/transaction non-empty";
+            try { ++cache_clear_refused_busy_; } catch (...) {}
+            publish(result);
+            // Counters must be visible in /stats + /metrics immediately: publish AFTER
+            // incrementing, not only mid-op (the mid-op snapshot predates the increment).
+            try { publish_runtime_stats(); } catch (...) {}
+            return true;
+        }
+        try {
+            if (busy) {
+                // Drain semantics: in-flight and queued work fails as retryable Overloaded,
+                // counted in failed_requests (the blast radius). Mirrors fail_all_locked but
+                // without marking the engine failed_.
+                const auto error = std::make_exception_ptr(
+                    RequestError(RequestErrorKind::Overloaded,
+                                 "admin cache-clear drained in-flight work"));
+                std::deque<std::shared_ptr<Request>> drained;
+                {
+                    std::lock_guard lock(queue_mutex_);
+                    drained.swap(pending_);
+                }
+                try { scheduler_.reset(); } catch (...) {}
+                const std::shared_ptr<Request> materializing_request =
+                    materializing_ ? materializing_->request : nullptr;
+                try { materializing_.reset(); } catch (...) {}
+                std::uint32_t failed = 0;
+                for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
+                    if (slots_[lane] != nullptr) {
+                        auto req = std::move(slots_[lane]);
+                        slots_[lane].reset();
+                        force_complete_error(req, error);
+                        ++failed;
+                    }
+                }
+                if (materializing_request != nullptr) {
+                    force_complete_error(materializing_request, error);
+                    ++failed;
+                }
+                for (const auto& req : drained) { force_complete_error(req, error); failed += 1; }
+                result.failed_requests = failed;
+                try { cache_clear_failed_requests_total_ += failed; } catch (...) {}
+                request_admission_check();
+            }
+            set_host_work_class(HostWorkClass::Control);
+            finish_engine_phase(boundary, EngineHostPhase::Boundary);
+            boundary = begin_host_phase();
+            // Scoped release (isolation batch-a): All keeps the fail_all_cleanup path;
+            // any other mask goes through Program::scoped_release and the scoped catalog
+            // reconciliation below. scoped_release preconditions mirror the strict
+            // release paths; false means refuse, never half-clear.
+            const std::uint32_t scope_bits = static_cast<std::uint32_t>(cmd.scope);
+            bool scoped_ok = true;
+            runtime::ScopedReleaseStats scoped_stats;
+            if (scope_bits == static_cast<std::uint32_t>(CacheScope::All)) {
+                cleanup_program_locked(ProgramCleanup::Failure);
+                result.detail = "cleared via fail_all_cleanup (non-fault reuse)";
+            } else {
+                try {
+                    scoped_ok = instance_.program->scoped_release(scope_bits, scoped_stats);
+                } catch (...) {
+                    scoped_ok = false;
+                }
+                if (scoped_ok) {
+                    try {
+                        resources_.clear_released_entries(*instance_.program);
+                    } catch (...) {
+                        scoped_ok = false;
+                    }
+                }
+                if (!scoped_ok) {
+                    result.state = CacheClearState::Failed;
+                    result.detail = "scoped release refused: preconditions unmet";
+                    publish(result);
+                    try { publish_runtime_stats(); } catch (...) {}
+                    return true;
+                }
+                char layer_buf[256];
+                std::snprintf(layer_buf, sizeof(layer_buf),
+                              "scoped release mask=0x%02x rel=[%u,%u,%u,%u,%u,%u,%u]"
+                              " skip=[%u,%u,%u,%u,%u,%u,%u]",
+                              scope_bits, scoped_stats.released[0], scoped_stats.released[1],
+                              scoped_stats.released[2], scoped_stats.released[3],
+                              scoped_stats.released[4], scoped_stats.released[5],
+                              scoped_stats.released[6], scoped_stats.skipped[0],
+                              scoped_stats.skipped[1], scoped_stats.skipped[2],
+                              scoped_stats.skipped[3], scoped_stats.skipped[4],
+                              scoped_stats.skipped[5], scoped_stats.skipped[6]);
+                result.detail = layer_buf;
+            }
+            try { publish_runtime_stats(); } catch (...) {}
+            std::uint64_t kv_after = 0, host_after = 0;
+            try {
+                const auto usage = instance_.program->physical_usage();
+                kv_after = static_cast<std::uint64_t>(usage.device_main_kv_pages) * 64;
+                host_after = static_cast<std::uint64_t>(usage.host_kv_bytes);
+            } catch (...) {}
+            result.kv_tokens_after = kv_after;
+            result.host_bytes_after = host_after;
+            result.state = CacheClearState::Done;
+            try { ++cache_clear_total_; } catch (...) {}
+            publish(result);
+            // Same ordering fix: the mid-op publish_runtime_stats() above ran before this
+            // increment, so re-publish to make the new total visible immediately.
+            try { publish_runtime_stats(); } catch (...) {}
+            try {
+                publish_diagnostic(diagnostics_, DiagnosticLevel::Info,
+                                   "admin cache-clear op=%llu mode=%d scope=0x%02x kv %llu->%llu host %llu->%llu failed=%u %s",
+                                   (unsigned long long)result.id, (int)cmd.mode, scope_bits,
+                                   (unsigned long long)kv_before, (unsigned long long)kv_after,
+                                   (unsigned long long)host_before, (unsigned long long)host_after,
+                                   result.failed_requests, result.detail.c_str());
+            } catch (...) {}
+            return true;
+        } catch (...) {
+            result.state = CacheClearState::Failed;
+            result.detail = "exception during admin clear";
+            publish(result);
+            return true;
+        }
+    }
+
+    [[nodiscard]] std::uint64_t enqueue_cache_clear(CacheScope scope, ClearMode mode, bool dry_run,
+                                                    std::string requested_by) {
+        CacheClearCmd cmd;
+        {
+            std::lock_guard lock(admin_mutex_);
+            cmd.id = next_admin_id_++;
+            if (cmd.id == 0) { cmd.id = next_admin_id_++; }
+            cmd.scope = scope;
+            cmd.mode = mode;
+            cmd.dry_run = dry_run;
+            cmd.requested_by = std::move(requested_by);
+            cmd.enqueued_at = Clock::now();
+            admin_queue_.push_back(cmd);
+            CacheClearResult placeholder;
+            placeholder.id = cmd.id;
+            placeholder.state = CacheClearState::Queued;
+            admin_results_[cmd.id] = placeholder;
+        }
+        queue_cv_.notify_one();
+        admin_cv_.notify_all();
+        return cmd.id;
+    }
+
+    [[nodiscard]] bool has_queued_admin() const {
+        std::lock_guard lock(admin_mutex_);
+        return !admin_queue_.empty();
+    }
+
+    [[nodiscard]] bool cache_clear_result(std::uint64_t id, CacheClearResult& out) const {
+        std::lock_guard lock(admin_mutex_);
+        const auto it = admin_results_.find(id);
+        if (it == admin_results_.end()) { return false; }
+        out = it->second;
+        return true;
+    }
+
     void fail_all_locked(std::exception_ptr error,
                          ProgramCleanup cleanup = ProgramCleanup::Failure) noexcept {
         std::deque<std::shared_ptr<Request>> pending;
@@ -2357,8 +2594,10 @@ private:
                     for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                         active = active || slots_[lane] != nullptr;
                     }
-                    if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                    if (!active && !has_queued_admin()) {
+                        queue_cv_.wait(lock, [&] {
+                            return stopping_ || !pending_.empty() || has_queued_admin();
+                        });
                     }
                 }
                 if (stopping_) {
@@ -2386,6 +2625,7 @@ private:
                 (void)settle_terminal_requests(boundary);
                 const auto cancelled_at_boundary = snapshot_cancellations();
                 cancel_active_requests(cancelled_at_boundary, boundary);
+                (void)service_admin_queue(boundary);
                 apply_device_kv_lease_settlements();
                 RoundMembership membership =
                     scheduler_.build_round_membership(slots_, max_concurrency_);
@@ -2551,8 +2791,17 @@ private:
     mutable std::mutex execution_mutex_;
     mutable std::mutex queue_mutex_;
     mutable std::mutex stats_mutex_;
+    mutable std::mutex admin_mutex_;
     std::condition_variable queue_cv_;
+    std::condition_variable admin_cv_;
     std::deque<std::shared_ptr<Request>> pending_;
+    std::deque<CacheClearCmd> admin_queue_;
+    std::uint64_t next_admin_id_ = 1;
+    std::map<std::uint64_t, CacheClearResult> admin_results_;
+    static constexpr std::size_t kAdminResultsCap = 64;
+    std::uint64_t cache_clear_total_ = 0;
+    std::uint64_t cache_clear_refused_busy_ = 0;
+    std::uint64_t cache_clear_failed_requests_total_ = 0;
     std::size_t outstanding_              = 0;
     std::uint64_t next_request_id_        = 1;
     std::uint64_t next_publication_order_ = 1;

@@ -95,6 +95,15 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
     append(out, "ninfer:context_cache_exhausted_requests_total", "counter",
            "Requests failed because the context cache had no placement for them.",
            static_cast<double>(stats.context_cache_exhausted_requests));
+    append(out, "ninfer:cache_clear_total", "counter",
+           "Admin cache-clear ops completed.",
+           static_cast<double>(stats.cache_clear_total));
+    append(out, "ninfer:cache_clear_refused_busy_total", "counter",
+           "Admin cache-clear ops refused because the engine was busy.",
+           static_cast<double>(stats.cache_clear_refused_busy));
+    append(out, "ninfer:cache_clear_failed_requests_total", "counter",
+           "In-flight requests failed by admin cache-clear drains.",
+           static_cast<double>(stats.cache_clear_failed_requests));
     append(out, "ninfer:uptime_seconds", "gauge", "Seconds since the Engine became ready.",
            sample.uptime_seconds);
     return out;

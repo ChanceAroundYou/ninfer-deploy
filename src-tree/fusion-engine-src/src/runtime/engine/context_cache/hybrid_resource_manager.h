@@ -361,6 +361,15 @@ public:
         lanes_.fill(Lane::Free);
     }
 
+    // Scoped-release reconciliation for the Hybrid core (isolation batch-a).
+    // This manager holds no catalog: lanes only. The worker drains/fails
+    // in-flight work before the scoped release runs, so this is a no-op guard
+    // keeping the EngineCore call site core-agnostic.
+    void clear_released_entries(Program&) noexcept {
+        open_lane_.reset();
+        lanes_.fill(Lane::Free);
+    }
+
 private:
     using Lane = LogicalLaneState;
 

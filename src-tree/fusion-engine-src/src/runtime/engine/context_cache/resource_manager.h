@@ -1498,6 +1498,82 @@ public:
         demand_epoch_ = 0;
     }
 
+    // Scoped-release reconciliation (isolation batch-a). After Program::scoped_release
+    // freed a subset of owners, drop exactly the catalog entries the Program no longer
+    // honours. Two signals, in order:
+    //  1. Slot-role signal (primary): the Program exposes per-slot roles through the
+    //     retained probes. A live entry whose slot the Program reports Free was freed
+    //     by the scoped pass (whole-owner release retires the slot) and is cleared.
+    //  2. Handle-validity signal (fallback): retained_device_kv_pages returns {} for
+    //     an invalid handle and never consumes it. A live, handle-holding entry whose
+    //     probe fails validity was freed and is cleared.
+    // A live owner whose KV pages were merely sliced (text/backend-only release) keeps
+    // its slot and its valid handle, so it is left alone: the next admission re-probes
+    // it through the normal inspect path and prices what remains. Never touches lanes:
+    // the worker drains/fails in-flight work before the scoped release runs.
+    // Session index: only cells owned by cleared entries are erased (erase_session_if_owner
+    // by entry id); surviving owners keep their session bindings so follow-up requests
+    // still hit.
+    void clear_released_entries(Program& program) noexcept {
+        for (CatalogEntry& entry : catalog_) {
+            if (entry.state == CatalogState::Vacant || !entry.handle) {
+                continue;
+            }
+            bool freed = false;
+            try {
+                freed = program.continuation_slot_free(*entry.handle);
+            } catch (...) {
+                freed = false;
+            }
+            if (!freed) {
+                try {
+                    auto probe = program.retained_device_kv_pages(*entry.handle);
+                    (void)probe;
+                    freed = !program.valid_continuation_handle(*entry.handle);
+                } catch (...) {
+                    freed = true;
+                }
+            }
+            if (freed) {
+                const std::uint64_t owner = entry.id;
+                clear_catalog_entry(entry);
+                try {
+                    erase_session_if_owner(owner);
+                } catch (...) {
+                }
+            }
+        }
+        for (SharedCatalogEntry& entry : shared_catalog_) {
+            if (entry.state == SharedCatalogState::Vacant || !entry.handle) {
+                continue;
+            }
+            bool freed = false;
+            try {
+                freed = program.shared_prefix_slot_free(*entry.handle);
+            } catch (...) {
+                freed = false;
+            }
+            if (!freed) {
+                try {
+                    auto probe = program.retained_device_kv_pages(*entry.handle);
+                    (void)probe;
+                    freed = !program.valid_shared_prefix_handle(*entry.handle);
+                } catch (...) {
+                    freed = true;
+                }
+            }
+            if (freed) {
+                clear_shared_entry(entry);
+            }
+        }
+        for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
+            lanes_[lane] = LogicalLaneState::Free;
+            reset_active_entry(active_[lane]);
+        }
+        demand_window_.clear();
+        demand_epoch_ = 0;
+    }
+
 private:
     struct Candidate {
         std::optional<AdmissionCandidate> plan;

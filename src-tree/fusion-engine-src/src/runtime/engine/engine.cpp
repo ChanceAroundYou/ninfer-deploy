@@ -557,6 +557,58 @@ bool Engine::is_available() const {
         impl_->core);
 }
 
+// Online cache release: Engine -> EngineCore admin queue (both core flavors share the
+// EngineCore::submit_cache_clear surface, so one visit covers Generation + Hybrid cores).
+std::uint64_t Engine::submit_cache_clear(const CacheClearRequest& req) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    const auto scope = static_cast<runtime::CacheScope>(req.scope_mask == 0 ? 0x7Fu : req.scope_mask);
+    const auto mode = req.mode == 1   ? runtime::ClearMode::DrainAndFail
+                      : req.mode == 2 ? runtime::ClearMode::AbortAndClear
+                                      : runtime::ClearMode::TryIdle;
+    return std::visit(
+        [&](auto& core) -> std::uint64_t {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::logic_error("Engine generation core is unavailable");
+            } else {
+                return core->submit_cache_clear(scope, mode, req.dry_run, req.requested_by);
+            }
+        },
+        impl_->core);
+}
+
+bool Engine::cache_clear_status(std::uint64_t id, CacheClearStatus& out) const {
+    if (impl_ == nullptr) { return false; }
+    return std::visit(
+        [&](auto& core) -> bool {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                return false;
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                return false;
+            } else {
+                runtime::CacheClearResult r;
+                if (!core->cache_clear_status(id, r)) { return false; }
+                out.id = r.id;
+                out.state = static_cast<std::uint8_t>(r.state);
+                out.detail = r.detail;
+                out.in_flight = r.in_flight;
+                out.materializing = r.materializing;
+                out.has_transaction = r.has_transaction;
+                out.failed_requests = r.failed_requests;
+                out.kv_tokens_before = r.kv_tokens_before;
+                out.kv_tokens_after = r.kv_tokens_after;
+                out.host_bytes_before = r.host_bytes_before;
+                out.host_bytes_after = r.host_bytes_after;
+                out.duration_ms = r.duration_ms;
+                return true;
+            }
+        },
+        impl_->core);
+}
+
 void Engine::reset_memory_peaks() noexcept {
     if (impl_ == nullptr) { return; }
     std::visit(
