@@ -5,6 +5,7 @@
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "runtime/prefix_cache/cost.h"
+#include "runtime/engine/scoped_release_stats.h"
 
 #include <cstddef>
 #include <string_view>
@@ -1107,6 +1108,22 @@ public:
     retained_device_kv_pages(const SharedPrefixHandle& shared) const noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
+    // Scoped (per-layer) cache release, isolation batch-a. Releases only the layers in
+    // `scope_mask` (CacheScope bits; see runtime/engine/cache_clear.h). Preconditions mirror
+    // release_continuation/release_shared_prefix: no live context transaction, no pending
+    // transaction, and the calling worker holds execution_mutex_ across the call. Layers
+    // with no releasable content are counted in `stats.skipped`, never fail the op.
+    // Returns false when preconditions are unmet (caller must refuse, never half-clear).
+    [[nodiscard]] bool scoped_release(std::uint32_t scope_mask,
+                                      runtime::ScopedReleaseStats& stats) noexcept;
+    // Read-only reconciliation probes (isolation batch-a). True when the slot behind
+    // the handle is Free (freed by a scoped whole-owner release) or the handle is no
+    // longer valid. Never consume the handle. Used by ResourceManager::
+    // clear_released_entries to drop exactly the catalog entries the scoped pass freed.
+    [[nodiscard]] bool continuation_slot_free(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool shared_prefix_slot_free(const SharedPrefixHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_continuation_handle(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_shared_prefix_handle(const SharedPrefixHandle& handle) const noexcept;
     // Discards every active and retained owner. When a release fails on state left inconsistent
     // by a thrown invariant, the context stores are rebuilt so no orphaned KV page, StateImage or
     // Host KV extent outlives its owner; the usage that survived the ordinary cleanup is returned

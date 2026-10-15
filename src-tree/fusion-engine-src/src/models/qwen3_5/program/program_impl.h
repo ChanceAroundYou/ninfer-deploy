@@ -1,6 +1,7 @@
 #pragma once
 #include "models/qwen3_5/program/speculative/mtp_adaptive.h"
 #include "models/qwen3_5/program/internal.h"
+#include "runtime/engine/scoped_release_stats.h"
 
 #include "core/arena.h"
 #include "core/disk_kv_bridge.h"
@@ -690,6 +691,14 @@ public:
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
     [[nodiscard]] ReleaseResult release_shared_prefix(SharedPrefixHandle&& shared) noexcept;
+    // Worker-side implementation of Program::scoped_release. Same preconditions; runs
+    // entirely under the caller's execution_mutex_.
+    [[nodiscard]] bool scoped_release(std::uint32_t scope_mask,
+                                      runtime::ScopedReleaseStats& stats) noexcept;
+    [[nodiscard]] bool continuation_slot_free(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool shared_prefix_slot_free(const SharedPrefixHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_continuation_handle(const ContinuationHandle& handle) const noexcept;
+    [[nodiscard]] bool valid_shared_prefix_handle(const SharedPrefixHandle& handle) const noexcept;
     [[nodiscard]] std::optional<qwen3_5::PhysicalUsageSnapshot>
     fail_all_cleanup(ProgramCleanup cleanup) noexcept;
     [[nodiscard]] bool context_stores_idle() const noexcept;

@@ -548,6 +548,27 @@ ReleaseResult Program::release_shared_prefix(SharedPrefixHandle&& shared) noexce
     return impl_->release_shared_prefix(std::move(shared));
 }
 
+bool Program::scoped_release(std::uint32_t scope_mask,
+                             runtime::ScopedReleaseStats& stats) noexcept {
+    return impl_->scoped_release(scope_mask, stats);
+}
+
+bool Program::continuation_slot_free(const ContinuationHandle& handle) const noexcept {
+    return impl_->continuation_slot_free(handle);
+}
+
+bool Program::shared_prefix_slot_free(const SharedPrefixHandle& handle) const noexcept {
+    return impl_->shared_prefix_slot_free(handle);
+}
+
+bool Program::valid_continuation_handle(const ContinuationHandle& handle) const noexcept {
+    return impl_->valid_continuation_handle(handle);
+}
+
+bool Program::valid_shared_prefix_handle(const SharedPrefixHandle& handle) const noexcept {
+    return impl_->valid_shared_prefix_handle(handle);
+}
+
 std::optional<PhysicalUsageSnapshot> Program::fail_all_cleanup() noexcept {
     return impl_->fail_all_cleanup(detail::ProgramCleanup::Failure);
 }
