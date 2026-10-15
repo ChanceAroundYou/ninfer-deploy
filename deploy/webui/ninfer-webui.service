@@ -1,0 +1,14 @@
+[Unit]
+Description=NInfer WebUI (qwen3.8-27b 256K)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/ET/chenran/llm-deploy/webui
+ExecStart=/home/ET/chenran/llm-deploy/runtime/webui-venv/bin/python /home/ET/chenran/llm-deploy/webui/ninfer-webui.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

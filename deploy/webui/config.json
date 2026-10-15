@@ -1,0 +1,12 @@
+{
+ "engine": "ninfer",
+ "ctx": 262144,
+ "mtp": true,
+ "n_max": 8,
+ "parallel": 4,
+ "autostart": true,
+ "port": 18471,
+ "think": true,
+ "out_len": 32768,
+ "samp_mode": "auto"
+}

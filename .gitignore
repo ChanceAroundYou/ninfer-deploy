@@ -1,8 +1,32 @@
-# local caches / build output
-.ms_upload_cache
-__pycache__/
-*.pyc
+# Build output and local runtime
 build*/
+runtime/
+models/
+staging/
+*.ninfer
+*.bundle
+
+# Python environments and generated files
+.venv/
+venv/
+venv*/
+__pycache__/
+*.py[cod]
+*.log
+*.out
+*.jsonl
+
+# Agent and editor state
+.mindfs/
+.claude/
+.ms_upload_cache
 .vs/
 Thumbs.db
 .DS_Store
+
+# Secrets and download staging
+.env
+.env.*
+!*.env.example
+qdl.env
+quark-downloads/
