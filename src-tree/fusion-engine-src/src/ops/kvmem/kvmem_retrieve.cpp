@@ -81,6 +81,10 @@ void kvmem_retrieve_validate(const KvMemRetrieveConfig& config) {
                                     ") must be a multiple of n_kv_heads (" +
                                     std::to_string(config.n_kv_heads) + ") for the GQA mapping");
     }
+    if (config.score_agg != KvMemRetrieveScoreAgg::Mean &&
+        config.score_agg != KvMemRetrieveScoreAgg::Max) {
+        throw std::invalid_argument(std::string(kSubject) + ": unknown score_agg");
+    }
     if (config.head_dim <= 0) {
         throw std::invalid_argument(std::string(kSubject) + ": head_dim must be positive");
     }

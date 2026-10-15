@@ -124,7 +124,14 @@ __device__ __forceinline__ float dot_q_sum<float>(const float* q, const float* k
 // blockIdx.x = layer * n_query_tokens + query_token. Every thread of the block cooperates on every
 // query head in turn, so the head loop is INSIDE the kernel (kernels_cuda.cu:5394) and phase 2 can
 // reuse the per-head statistics from phase 1 out of shared memory.
-template <typename QT>
+//
+// MAX = false (Mean, Eq.10 default): the unit is the query head -- s_stats holds 2*n_heads floats,
+// head_w = 1/(L_total*n_heads).
+// MAX = true (Max opt-in): the unit is the KV head -- each (l,m,kvh) softmaxes over blocks with the
+// group's MAX logit, so one strong head in a GQA group suffices to pull the block's mass to 1.
+// s_stats holds 2*n_kv_heads floats, head_w = 1/(L_total*n_kv_heads). The sum_b == n_query_tokens
+// invariant holds either way: every (l,m,unit) is still exactly one softmax over the blocks.
+template <typename QT, bool MAX>
 __global__ void kvmem_retrieve_scores_kernel(float* __restrict__ score,
                                              const QT* __restrict__ q_multi,
                                              const float* __restrict__ kbar_sum,
@@ -142,7 +149,9 @@ __global__ void kvmem_retrieve_scores_kernel(float* __restrict__ score,
     const int lane = tid & (kWarpSize - 1);
     const int warp = tid / kWarpSize;
 
-    // [0, n_heads) = per-head max, [n_heads, 2*n_heads) = per-head softmax denominator.
+    // [0, n_units) = per-unit max, [n_units, 2*n_units) = per-unit softmax denominator, where
+    // the unit is the query head in Mean mode (n_units = n_heads) and the KV head in Max mode
+    // (n_units = n_kv_heads). The launch sizes the buffer from config.score_agg (see below).
     extern __shared__ float s_stats[];
     __shared__ float       s_wm[kRetrieveWarps];
     __shared__ float       s_ws[kRetrieveWarps];
@@ -158,25 +167,44 @@ __global__ void kvmem_retrieve_scores_kernel(float* __restrict__ score,
         kbar_sum + static_cast<long long>(l) * kbar_layer_stride * n_kv_heads * head_dim;
     const int group = n_heads / n_kv_heads;
 
-    // ---- Phase 1: per-head (max, denominator) over the INCLUDED blocks only.
+    // ---- Phase 1: per-unit (max, denominator) over the INCLUDED blocks only.
+    //
+    // The unit is the query head in Mean mode and the KV head in Max mode. Max takes the group's
+    // MAX logit per block, so the (m, denom) pair describes the max-logit distribution, not the
+    // average one -- one strong head in the group suffices to pull the block's mass to 1.
     //
     // The included range is the retrievable middle: the reference sets logit = -inf for the
     // always-kept sink/recent bands (kernels_cuda.cu:5400-5407) so their mass redistributes. Skipping
     // them is the same arithmetic and never evaluates exp(-inf - -inf), which would be NaN if a
     // caller ever passed a range with no included block at all.
-    for (int qh = 0; qh < n_heads; ++qh) {
-        const int kvh  = qh / group;
-        const QT* qr   = q_l + (static_cast<long long>(q_token_begin + t) * n_heads + qh) * head_dim;
+    const int n_units = MAX ? n_kv_heads : n_heads;
+    for (int u = 0; u < n_units; ++u) {
         float     lm   = -CUDART_INF_F;
         float     ls   = 0.0f;
         for (int b = incl_lo + tid; b < incl_hi; b += kRetrieveThreads) {
-            const float* krow = kbar_l + (static_cast<long long>(b) * n_kv_heads + kvh) * head_dim;
             // The mean is formed here: sum / count, folded into the logit scale. A null count array
             // means the operand is already a mean (count == 1).
-            const float invc  = block_tokens != nullptr
-                                    ? 1.0f / static_cast<float>(block_tokens[b])
-                                    : 1.0f;
-            const float logit = (scale * invc) * dot_q_sum<QT>(qr, krow, head_dim);
+            const float invc    = block_tokens != nullptr
+                                      ? 1.0f / static_cast<float>(block_tokens[b])
+                                      : 1.0f;
+            const float logit_w = scale * invc;
+            float       logit;
+            if constexpr (MAX) {
+                const float* krow = kbar_l + (static_cast<long long>(b) * n_kv_heads + u) * head_dim;
+                logit             = -CUDART_INF_F;
+                for (int g = 0; g < group; ++g) {
+                    const int qh = u * group + g;
+                    const QT* qr =
+                        q_l + (static_cast<long long>(q_token_begin + t) * n_heads + qh) * head_dim;
+                    const float cand = logit_w * dot_q_sum<QT>(qr, krow, head_dim);
+                    if (cand > logit) { logit = cand; }
+                }
+            } else {
+                const int    kvh  = u / group;
+                const QT*    qr   = q_l + (static_cast<long long>(q_token_begin + t) * n_heads + u) * head_dim;
+                const float* krow = kbar_l + (static_cast<long long>(b) * n_kv_heads + kvh) * head_dim;
+                logit             = logit_w * dot_q_sum<QT>(qr, krow, head_dim);
+            }
             // Online softmax: keep the running max and rescale the running sum. The first finite
             // logit finds lm == -inf, where expf(-inf) == 0 makes the rescale a no-op.
             if (logit > lm) {
@@ -208,8 +236,8 @@ __global__ void kvmem_retrieve_scores_kernel(float* __restrict__ score,
                 }
                 gs += s_ws[w] * expf(m - gm);
             }
-            s_stats[qh]           = gm;
-            s_stats[n_heads + qh] = gs;
+            s_stats[u]             = gm;
+            s_stats[n_units + u] = gs;
         }
         __syncthreads();
     }
@@ -218,26 +246,47 @@ __global__ void kvmem_retrieve_scores_kernel(float* __restrict__ score,
     //
     // The head loop is inside so the atomics are n_heads times fewer than one per (block, head), and
     // the store is coalesced across the block dimension. head_w carries the mean over layers AND over
-    // heads, which is what turns the grid-wide sum into Eq.10's "sum_m mean_l mean_h".
+    // units (query heads in Mean, KV heads in Max), which is what turns the grid-wide sum into
+    // Eq.10's "sum_m mean_l mean_h" -- with mean_h over the group-max distribution in Max mode.
     for (int b = incl_lo + tid; b < incl_hi; b += kRetrieveThreads) {
-        const float invc      = block_tokens != nullptr
-                                    ? 1.0f / static_cast<float>(block_tokens[b])
-                                    : 1.0f;
-        const float logit_w   = scale * invc;
-        float       local     = 0.0f;
-        for (int qh = 0; qh < n_heads; ++qh) {
-            const float gm = s_stats[qh];
-            const float gs = s_stats[n_heads + qh];
-            // Unreachable while the band rule guarantees a non-empty middle, and defended anyway:
-            // contributing nothing is the correct degenerate answer, whereas dividing by a zero
-            // denominator would write inf/NaN into the score the selector sorts on.
-            if (gm == -CUDART_INF_F || gs <= 0.0f) { continue; }
-            const int    kvh  = qh / group;
-            const QT*    qr =
-                q_l + (static_cast<long long>(q_token_begin + t) * n_heads + qh) * head_dim;
-            const float* krow = kbar_l + (static_cast<long long>(b) * n_kv_heads + kvh) * head_dim;
-            const float  logit = logit_w * dot_q_sum<QT>(qr, krow, head_dim);
-            local += expf(logit - gm) * (head_w / gs);
+        const float invc    = block_tokens != nullptr
+                                  ? 1.0f / static_cast<float>(block_tokens[b])
+                                  : 1.0f;
+        const float logit_w = scale * invc;
+        float       local   = 0.0f;
+        if constexpr (MAX) {
+            for (int kvh = 0; kvh < n_kv_heads; ++kvh) {
+                const float gm = s_stats[kvh];
+                const float gs = s_stats[n_kv_heads + kvh];
+                // Unreachable while the band rule guarantees a non-empty middle, and defended anyway:
+                // contributing nothing is the correct degenerate answer, whereas dividing by a zero
+                // denominator would write inf/NaN into the score the selector sorts on.
+                if (gm == -CUDART_INF_F || gs <= 0.0f) { continue; }
+                const float* krow =
+                    kbar_l + (static_cast<long long>(b) * n_kv_heads + kvh) * head_dim;
+                float best = -CUDART_INF_F;
+                for (int g = 0; g < group; ++g) {
+                    const int qh = kvh * group + g;
+                    const QT* qr =
+                        q_l + (static_cast<long long>(q_token_begin + t) * n_heads + qh) * head_dim;
+                    const float logit = logit_w * dot_q_sum<QT>(qr, krow, head_dim);
+                    if (logit > best) { best = logit; }
+                }
+                local += expf(best - gm) * (head_w / gs);
+            }
+        } else {
+            for (int qh = 0; qh < n_heads; ++qh) {
+                const float gm = s_stats[qh];
+                const float gs = s_stats[n_heads + qh];
+                // Same degenerate guard as above.
+                if (gm == -CUDART_INF_F || gs <= 0.0f) { continue; }
+                const int    kvh  = qh / group;
+                const QT*    qr =
+                    q_l + (static_cast<long long>(q_token_begin + t) * n_heads + qh) * head_dim;
+                const float* krow = kbar_l + (static_cast<long long>(b) * n_kv_heads + kvh) * head_dim;
+                const float  logit = logit_w * dot_q_sum<QT>(qr, krow, head_dim);
+                local += expf(logit - gm) * (head_w / gs);
+            }
         }
         if (local != 0.0f) {
             atomicAdd(&score[b], local);
@@ -259,6 +308,13 @@ cudaError_t launch_kvmem_retrieve_scores(const KvMemRetrieveConfig& config, floa
     if (config.n_heads <= 0 || config.n_kv_heads <= 0 || config.n_heads % config.n_kv_heads != 0) {
         return cudaErrorInvalidValue;
     }
+    // The validating entry point (kvmem_retrieve_scores) rejects unknown aggregations with an
+    // exception; this bare launch sees verifier-driven configs, so refuse loudly rather than
+    // silently scoring Mean for a misspelled mode.
+    if (config.score_agg != KvMemRetrieveScoreAgg::Mean &&
+        config.score_agg != KvMemRetrieveScoreAgg::Max) {
+        return cudaErrorInvalidValue;
+    }
     const int incl_lo = mask.active ? mask.lo_end : 0;
     const int incl_hi = mask.active ? mask.hi_begin : config.n_blocks;
     // A mask that leaves nothing competing means no block receives mass at all; returning early keeps
@@ -268,34 +324,65 @@ cudaError_t launch_kvmem_retrieve_scores(const KvMemRetrieveConfig& config, floa
         static_cast<long long>(config.n_layers) * static_cast<long long>(config.n_query_tokens);
     if (grid_x > 0x7fffffffLL) { return cudaErrorInvalidValue; }
 
-    // head_w carries the mean over LAYERS and heads. It must be built from the model's TOTAL
-    // full-attention layer count, not from this call's layer count: in the live-window mode the caller
-    // issues one launch per layer (only one qn is alive at a time), and using 1/(1*H) there would make
-    // the 16 accumulated calls 16x too large.
-    const int   total_layers = config.n_layers_total > 0 ? config.n_layers_total : config.n_layers;
+    // head_w carries the mean over LAYERS and units (query heads in Mean, KV heads in Max). It
+    // must be built from the model's TOTAL full-attention layer count, not from this call's layer
+    // count: in the live-window mode the caller issues one launch per layer (only one qn is alive
+    // at a time), and using 1/(1*H) there would make the 16 accumulated calls 16x too large.
+    // The unit count comes from score_agg: Mean divides by n_heads, Max by n_kv_heads, so each
+    // (l,m,unit) softmax contributes exactly 1 and the sum_b == n_query_tokens invariant holds
+    // in both modes.
+    const bool max_mode     = config.score_agg == KvMemRetrieveScoreAgg::Max;
+    const int  n_units      = max_mode ? config.n_kv_heads : config.n_heads;
+    const int  total_layers = config.n_layers_total > 0 ? config.n_layers_total : config.n_layers;
     const float head_w =
-        1.0f / (static_cast<float>(total_layers) * static_cast<float>(config.n_heads));
-    const std::size_t shmem = 2u * sizeof(float) * static_cast<std::size_t>(config.n_heads);
+        1.0f / (static_cast<float>(total_layers) * static_cast<float>(n_units));
+    const std::size_t shmem = 2u * sizeof(float) * static_cast<std::size_t>(n_units);
     const dim3        grid(static_cast<unsigned>(grid_x));
 
+    // One instantiation per (query dtype, aggregation): the branch is compile-time so the Mean
+    // path is bit-identical to the pre-Max kernel (same instruction stream, same shmem layout).
     if (config.dtype == KvMemRetrieveDtype::BF16) {
-        kvmem_retrieve_scores_kernel<__nv_bfloat16><<<grid, kRetrieveThreads, shmem, stream>>>(
-            score, static_cast<const __nv_bfloat16*>(q), kbar_sum, block_tokens, config.n_layers,
-            config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
-            config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
-            incl_lo, incl_hi, scale, head_w);
+        if (max_mode) {
+            kvmem_retrieve_scores_kernel<__nv_bfloat16, true><<<grid, kRetrieveThreads, shmem, stream>>>(
+                score, static_cast<const __nv_bfloat16*>(q), kbar_sum, block_tokens, config.n_layers,
+                config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
+                config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
+                incl_lo, incl_hi, scale, head_w);
+        } else {
+            kvmem_retrieve_scores_kernel<__nv_bfloat16, false><<<grid, kRetrieveThreads, shmem, stream>>>(
+                score, static_cast<const __nv_bfloat16*>(q), kbar_sum, block_tokens, config.n_layers,
+                config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
+                config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
+                incl_lo, incl_hi, scale, head_w);
+        }
     } else if (config.dtype == KvMemRetrieveDtype::F16) {
-        kvmem_retrieve_scores_kernel<__half><<<grid, kRetrieveThreads, shmem, stream>>>(
-            score, static_cast<const __half*>(q), kbar_sum, block_tokens, config.n_layers,
-            config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
-            config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
-            incl_lo, incl_hi, scale, head_w);
+        if (max_mode) {
+            kvmem_retrieve_scores_kernel<__half, true><<<grid, kRetrieveThreads, shmem, stream>>>(
+                score, static_cast<const __half*>(q), kbar_sum, block_tokens, config.n_layers,
+                config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
+                config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
+                incl_lo, incl_hi, scale, head_w);
+        } else {
+            kvmem_retrieve_scores_kernel<__half, false><<<grid, kRetrieveThreads, shmem, stream>>>(
+                score, static_cast<const __half*>(q), kbar_sum, block_tokens, config.n_layers,
+                config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
+                config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
+                incl_lo, incl_hi, scale, head_w);
+        }
     } else {
-        kvmem_retrieve_scores_kernel<float><<<grid, kRetrieveThreads, shmem, stream>>>(
-            score, static_cast<const float*>(q), kbar_sum, block_tokens, config.n_layers,
-            config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
-            config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
-            incl_lo, incl_hi, scale, head_w);
+        if (max_mode) {
+            kvmem_retrieve_scores_kernel<float, true><<<grid, kRetrieveThreads, shmem, stream>>>(
+                score, static_cast<const float*>(q), kbar_sum, block_tokens, config.n_layers,
+                config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
+                config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
+                incl_lo, incl_hi, scale, head_w);
+        } else {
+            kvmem_retrieve_scores_kernel<float, false><<<grid, kRetrieveThreads, shmem, stream>>>(
+                score, static_cast<const float*>(q), kbar_sum, block_tokens, config.n_layers,
+                config.n_query_tokens, config.n_heads, config.n_kv_heads, config.head_dim,
+                config.q_layer_stride, config.q_token_begin, config.n_blocks, config.kbar_layer_stride,
+                incl_lo, incl_hi, scale, head_w);
+        }
     }
     return cudaGetLastError();
 }

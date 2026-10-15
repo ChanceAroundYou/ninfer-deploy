@@ -1741,12 +1741,20 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
         if (!kept.empty() && scored > 0 && !scores.empty()) {
             std::vector<std::pair<float, std::uint32_t>> ranked;
             ranked.reserve(kept.size());
+            // ★ LRFU（2026-10-15，整编点）：LRFU 开时按 lrfu_score（candidate 优先，否则
+            //   committed）重排 kept；关时 kvmem_score_rank_key 返回当轮分 = 逐位旧行为（负控）。
+            //   kept 仍由当轮 kvmem_select_blocks 产生（上面读的 kept），这里只换重排键 ——
+            //   ks 绝不写回 set_retrieval_scores 信号（D1 的另一半）。
+            const bool lrfu_on = ops::detail::kvmem_score_lrfu_on();
             for (const std::int32_t block : kept) {
                 if (block < 0 || block >= scored) { continue; }
                 const std::uint32_t page = static_cast<std::uint32_t>(block);
                 if (page < begin || page >= end) { continue; }
                 if (static_cast<std::size_t>(block) >= scores.size()) { continue; }
-                ranked.emplace_back(scores[static_cast<std::size_t>(block)], page);
+                ranked.emplace_back(
+                    lrfu_on ? ops::detail::kvmem_score_lrfu_score(sequence.lane, block)
+                            : scores[static_cast<std::size_t>(block)],
+                    page);
             }
             if (!ranked.empty()) {
                 std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {

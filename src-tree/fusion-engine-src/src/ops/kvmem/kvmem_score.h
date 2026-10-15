@@ -41,6 +41,7 @@
 //     上打分（skip long chunk tokens=1024 > MAXQ=256）"那块拦路石。默认 0 = 旧行为（逐位不变）。
 //   * 本探针**不改可见集** ⇒ 它与"答案对不对"无关；要验证"被选中 ⇒ 真的进了 softmax"必须等第二刀。
 
+#include "ops/kvmem/kvmem_lrfu.h"
 #include "ops/kvmem/kvmem_retrieve_launch.h"
 #include "ops/kvmem/kvmem_select.h"
 #include "ops/kvmem/mean_k_index.h"
@@ -110,6 +111,32 @@ inline bool kvmem_score_env_flag(const char* name, bool fallback) noexcept {
     return std::strtol(v, nullptr, 10) != 0;
 }
 
+// ---- GQA 组内聚合开关（Max 项，2026-10-15）---------------------------------------------------
+//
+//   NINFER_TERNARY_KVMEM_SCORE_AGG=max  ⇒ 内核按 per-KV-head 组内 max 统计（上游同名
+//   GqaScoreAggregation::Max）；未设/空/`mean`/其它 ⇒ Mean（Eq.10 默认，负控：逐位旧行为）。
+//   字符串比较（`mean`/`max`），故不能走 env_i32/env_flag（那两个只认数字）；大小写敏感，
+//   与上游 `parse_score_aggregation`（mean|max 小写）同口径，大写一律回落 Mean 并喊一行。
+//   读法：每次 accumulate 读一次（与 QUERY_TAIL/MAXQ 等数值旋钮同形），以便同一进程内
+//   A/B 对照（Mean 臂与 Max 臂只需换 env 重跑同一 fixture）。
+inline ops::KvMemRetrieveScoreAgg kvmem_score_agg_mode() noexcept {
+    const char* v = std::getenv("NINFER_TERNARY_KVMEM_SCORE_AGG");
+    if (v == nullptr || v[0] == '\0' || v[1] == '\0') { return ops::KvMemRetrieveScoreAgg::Mean; }
+    if (v[0] == 'm' && v[1] == 'a' && v[2] == 'x' && v[3] == '\0') {
+        return ops::KvMemRetrieveScoreAgg::Max;
+    }
+    if (!((v[0] == 'm' && v[1] == 'e' && v[2] == 'a' && v[3] == 'n' && v[4] == '\0'))) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr,
+                         "kvmem_score: unknown NINFER_TERNARY_KVMEM_SCORE_AGG=%s, falling back to mean\n",
+                         v);
+        }
+    }
+    return ops::KvMemRetrieveScoreAgg::Mean;
+}
+
 // ---- 探针状态（进程级单例，与 mean-K 索引同寿命）---------------------------------------------
 struct KvMemScoreProbe {
     // device 缓冲
@@ -155,6 +182,14 @@ struct KvMemScoreProbe {
     bool failed   = false;                 // 出过致命几何/分配错 ⇒ 之后一律不打分（但引擎继续跑）
     bool logged_once = false;
     bool logged_span_segment = false;   // B05: 长 span 改为切段打分，只喊一次（它是"行为变了"的证据行）
+    bool last_agg_max = false;          // 最近一次 finish 的聚合模式（SELECT 行 agg= 审计用）
+    // ---- ★ LRFU 跨轮 keep-score（D1，2026-10-15）------------------------------------------------
+    //   ks = committed（上一轮提交的 KS），ks_candidate = preview（本轮候选），ks_round = 已
+    //   提交轮数。score_host 是**当轮**分数（selector 的输入），ks 是**跨轮**累积（重排键）——
+    //   两者绝不复用（P0-3/D1：同轮第二次评分若复用，就会把一次性 cosine 停留在选择信号上）。
+    //   更新只在 finish() 内：先 commit 上轮（若有 candidate），再用本轮 D2H 分数 preview；
+    //   没打分的 chunk 直接丢弃（D3：轮次只在提交时推进）。begin 不碰 ks ⇒ decode 不推进。
+    KvMemLrfuState lrfu;
 };
 
 // B06: one probe PER LANE. The probe carries the score buffer, the kept block set and the
@@ -452,6 +487,8 @@ inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const 
     cfg.recent_blocks     = 0;
     cfg.mask_mode         = KvMemRetrieveMaskMode::Never;   // 探针要"全历史"的原始分数，不套带掩码
     cfg.dtype             = KvMemRetrieveDtype::BF16;
+    cfg.score_agg         = kvmem_score_agg_mode(); // Max 项：mean 默认（负控），max 显式开
+    p.last_agg_max        = (cfg.score_agg == ops::KvMemRetrieveScoreAgg::Max);
 
     // One call per MAXQ-sized segment -- a single call for the ordinary short span, which keeps the
     // common path bit-identical. `p.score` is accumulated by the kernel, so the segments sum exactly
@@ -486,7 +523,13 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
     KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (!p.armed || p.failed || p.n_blocks <= 0) { return; }
     p.armed = false;
-    if (!p.scored_this_chunk) { return; }   // 本 chunk 没打过（如长 ingest）⇒ 不打印全零假日志
+    // ★ D3（2026-10-15）：没打分的 chunk 直接丢弃、永不 commit（P0-4 修掉的"幽灵轮"）。
+    //   注意顺序：先 return 之前**不**碰 lrfu —— 上轮的 candidate 留给下一个真打分的 finish
+    //   去 commit（"先 commit 上轮，再 preview 本轮"）；decode 从不调 begin/finish，不推进轮次。
+    if (!p.scored_this_chunk) {
+        if (kvmem_lrfu_enabled()) { kvmem_lrfu_discard(p.lrfu); }
+        return;   // 本 chunk 没打过（如长 ingest）⇒ 不打印全零假日志
+    }
     // ★ 出处登记（2026-09-26 语义档的准入闸）：这份分数描述块 [0, n_blocks)，且来自**最近一个
     //   chunk 的 query**。语义档只在 scored_last_chunk 为真时才用它装窗（宁可退压力档，也不装
     //   一个来路不明的窗）。
@@ -527,6 +570,41 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
     // previous selection intact instead of emptying it.
     p.kept = sel.kept;
 
+    // ★ D3（2026-10-15）：finish 内先 commit 上轮、再 preview 本轮（P0-4：轮次只在提交时推进）。
+    //   上轮 candidate 在这里变成 committed；本轮 D2H 分数变成新的 candidate。kept 仍由当轮
+    //   selector 产生（上面），LRFU 只影响后续的重排键 —— ks 绝不写回 set_retrieval_scores
+    //   信号（D1 的另一半，见 select_retrieval_pages 内容路）。
+    //   LRFU 关时：零成本（一次 env 读 + 直接返回，ks 全空，lrfu_score 恒 0）。
+    bool          lrfu_on    = kvmem_lrfu_enabled();
+    std::uint64_t lrfu_round = p.lrfu.ks_round;
+    if (lrfu_on) {
+        (void)kvmem_lrfu_commit(p.lrfu);  // 上轮 candidate → committed（无 candidate 时 no-op）
+        lrfu_round = p.lrfu.ks_round;
+        kvmem_lrfu_preview(p.lrfu, p.score_host.data(), static_cast<std::size_t>(p.n_blocks),
+                           kvmem_lrfu_lambda(), kvmem_lrfu_top_frac());
+    }
+
+    // ★ KS 轨迹审计（LRFU 开时）：打出 committed KS 最大的前 8 个块（id:ks），供"换问后旧块
+    //   衰减 0.9→0.45 量级"的抽查。关时不打（负控日志逐位旧行为，只多 agg=/lrfu= 两个后缀）。
+    if (lrfu_on && !p.lrfu.ks.empty()) {
+        std::vector<std::uint32_t> order(p.lrfu.ks.size());
+        for (std::uint32_t i = 0; i < order.size(); ++i) { order[i] = i; }
+        std::partial_sort(order.begin(),
+                          order.begin() + static_cast<std::ptrdiff_t>(
+                                              std::min<std::size_t>(order.size(), 8)),
+                          order.end(), [&](std::uint32_t a, std::uint32_t b) {
+                              return p.lrfu.ks[a] != p.lrfu.ks[b] ? p.lrfu.ks[a] > p.lrfu.ks[b]
+                                                                  : a < b;
+                          });
+        std::fprintf(stderr, "kvmem_score: KS_TOP round=%llu",
+                     static_cast<unsigned long long>(lrfu_round));
+        for (std::size_t i = 0; i < order.size() && i < 8; ++i) {
+            std::fprintf(stderr, " %u:%.4f", order[i],
+                         static_cast<double>(p.lrfu.ks[order[i]]));
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     // 选择结构的形状（这是判据的核心：非连续 ⇒ 真在选择）
     std::int32_t runs = 0;
     for (std::size_t i = 0; i < sel.kept.size(); ++i) {
@@ -552,7 +630,8 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
                  "recent_blocks=%d kept=%zu runs=%d skip=%d window_tokens=%zu "
                  "sink_kept=%d recent_kept=%d scored_kept=%d candidates=%d kept_range=[%d,%d] "
                  "sum_score=%.3f query_tokens=%d span_mode=%s span_abs=[%d,%d) chunk_abs=%d "
-                 "span_local=[%d,%d) oracle_ok=%d scale_floor=%.6f harvest_layers=%d/%d\n",
+                 "span_local=[%d,%d) oracle_ok=%d scale_floor=%.6f harvest_layers=%d/%d agg=%s "
+                 "lrfu=%s lrfu_round=%llu\n",
                  label, p.n_blocks, scfg.budget_blocks, scfg.sink_blocks, scfg.recent_blocks,
                  sel.kept.size(), runs, skip,
                  sel.kept.size() * static_cast<std::size_t>(p.block_tokens), sel.sink_kept,
@@ -561,7 +640,45 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
                  p.abs_chunk_begin, p.query_span_begin, p.query_span_begin + p.query_span_tokens,
                  (q_used > 0 && sum_score > 0.5 * q_used && sum_score < 2.0 * q_used) ? 1 : 0,
                  static_cast<double>(ops::kvmem_retrieve_scale(p.head_dim)), p.harvest_layers,
-                 p.harvest_layers_total);
+                 p.harvest_layers_total,
+                 p.last_agg_max ? "max" : "mean", lrfu_on ? "on" : "off",
+                 static_cast<unsigned long long>(lrfu_round));
+}
+
+// ---- LRFU 读口（D1）：select_retrieval_pages 内容路的重排键 ------------------------------
+//
+//   LRFU 开时按 lrfu_score 重排 kept；关时恒 0（调用方按当轮分重排，逐位旧行为）。
+//   kept 仍由当轮 kvmem_select_blocks 产生 —— 这里只读、不改 kept（D1 的另一半）。
+inline float kvmem_score_lrfu_score(std::uint32_t lane, std::int32_t block) noexcept {
+    const KvMemScoreProbe& p = kvmem_score_probe(lane);
+    if (block < 0) { return 0.0f; }
+    return kvmem_lrfu_score(p.lrfu, static_cast<std::size_t>(block));
+}
+
+// LRFU 是否开着（内容路用：开时按 lrfu_score 重排，关时按当轮分 —— 负控逐位旧行为）。
+inline bool kvmem_score_lrfu_on() noexcept {
+    return kvmem_lrfu_enabled();
+}
+
+// ---- LRFU 重排键（D1 的消费侧，整编时由 select_retrieval_pages 内容路调用）-----------
+//
+//   整编 patch（context.cpp select_retrieval_pages 内容路，ranked.emplace_back 处）：
+//     ranked.emplace_back(scores[block], page);
+//     → ranked.emplace_back(kvmem_score_rank_key(lane, scores, block), page);
+//   LRFU 开时按 lrfu_score（candidate 优先，否则 committed）重排；关时返回当轮分
+//   （逐位旧行为 = 负控）。kept 仍由当轮 kvmem_select_blocks 产生 —— 这里只提供键，
+//   不改 kept（D1 的另一半：ks 绝不写回 set_retrieval_scores 信号）。
+//   lane 由调用方传入（= SequenceState::lane，与 kept/scores 的读取口径一致）。
+inline float kvmem_score_rank_key(std::uint32_t lane, const std::vector<float>& scores,
+                                  std::int32_t block) noexcept {
+    if (kvmem_lrfu_enabled()) { return kvmem_score_lrfu_score(lane, block); }
+    if (block < 0 || static_cast<std::size_t>(block) >= scores.size()) { return 0.0f; }
+    return scores[static_cast<std::size_t>(block)];
+}
+
+// LRFU 已提交轮数（KS 轨迹审计：换问后旧块衰减 0.9→0.45 量级的抽查口）。
+inline std::uint64_t kvmem_score_lrfu_round(std::uint32_t lane) noexcept {
+    return kvmem_score_probe(lane).lrfu.ks_round;
 }
 
 // 逐块分数导出（给离线判据用：核对"含针的块"有没有被选中）。只在 switch 打开且本 chunk 打过时写。

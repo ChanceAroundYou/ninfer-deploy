@@ -34,7 +34,9 @@
 //      everything. (docs/kvmem_implementation_notes.md:590-602)
 //   2. THE SCORE IS A SUM OVER QUERY TOKENS but a MEAN over layers and heads. The mean over layers
 //      and heads folds into a constant weight, head_w = 1/(n_layers_total*n_heads)
-//      (kernels_cuda.cu:5392-5393, 5435). The reference notes the sum over query tokens is a choice,
+//      (kernels_cuda.cu:5392-5393, 5435), or 1/(n_layers_total*n_kv_heads) in Max aggregation mode
+//      (KvMemRetrieveScoreAgg -- the unit averaged over is then the KV head, not the query head).
+//      The reference notes the sum over query tokens is a choice,
 //      not a necessity -- every block sees the same query token count, so it cannot change the
 //      ranking within one request (implementation_notes.md:575-577) -- but it does make the invariant
 //      below exact.
@@ -147,6 +149,15 @@ namespace ninfer::ops {
 // F32 is the verifier's diagnostic arm.
 enum class KvMemRetrieveDtype : std::uint8_t { BF16 = 0, F16 = 1, F32 = 2 };
 
+// How the GQA group's per-query-head masses collapse onto one KV head. Names and values match the
+// upstream sibling (kvmem/mean_key_retrieval.hpp: GqaScoreAggregation) so the two arms stay
+// comparable by inspection:
+//   Mean -- every (l,m,qh) softmaxes over blocks, then the group averages (the Eq.10 default).
+//   Max  -- each (l,m,kvh) softmaxes over blocks with the group's MAX logit, so one strong head in
+//           the group is enough to pull the block's mass to 1. The sum_b == n_query_tokens invariant
+//           holds either way: each (l,m,·) unit is still exactly one softmax over the blocks.
+enum class KvMemRetrieveScoreAgg : std::uint8_t { Mean = 0, Max = 1 };
+
 // The always-kept bands excluded from the softmax, as an included range [lo_end, hi_begin).
 // `active == false` means the whole history [0, n_blocks) competes.
 struct KvMemRetrieveMask {
@@ -197,6 +208,12 @@ struct KvMemRetrieveConfig {
 
     KvMemRetrieveMaskMode mask_mode = KvMemRetrieveMaskMode::Official;
     KvMemRetrieveDtype    dtype     = KvMemRetrieveDtype::BF16;  // QUERY dtype only
+
+    // GQA aggregation. Mean is the Eq.10 default and the only mode that reproduces the shipping
+    // configuration; Max is the upstream-named opt-in (GqaScoreAggregation::Max) for the group-
+    // disagreement case. Plain field (not bool): unknown values are rejected by validate(), the
+    // same way a non-multiple head count is.
+    KvMemRetrieveScoreAgg score_agg = KvMemRetrieveScoreAgg::Mean;
 };
 
 // scale = 1/sqrt(head_dim), exactly as src/qwen_executor.cpp:23755. Returned as float because that is
