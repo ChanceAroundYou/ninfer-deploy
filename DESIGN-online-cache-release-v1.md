@@ -1,7 +1,9 @@
-# NInfer 在线缓存释放设计稿 v1（隔离侧，待隔离构建验证）
+# NInfer 在线缓存释放设计稿 v1（隔离侧，✅ 隔离构建已验证）
 
-日期：2026-10-14｜作者：Claude 隔离实验｜状态：设计稿，未进生产
-约束：生产 `3287635:18471` 只读；GPU0/1 他人进程不动；验证只用 GPU4 隔离实例；`clearkv=restart` 现状不变直到隔离验证通过。
+日期：2026-10-14｜作者：Claude 隔离实验｜状态：**隔离全矩阵绿，未进生产**
+更新 2026-10-15：§8-④⑤⑥ + 按层释放 + 耗时对照全部实测收敛；生产 `556909:18471` 只读
+（注意：生产 PID 由他人重启 `3287635→556909`，约 04:38，非本实验所动）；GPU0/1 他人进程不动；
+验证只用 GPU4 隔离实例；`clearkv=restart` 现状不变直到生产评审通过。
 
 ---
 
@@ -55,7 +57,12 @@ struct CacheClearCmd {
 | `DrainAndFail` | 在途全部 `force_complete_error(Overloaded, retryable)`，pending 同理 | 先 abort（同 fail_all 顺序） | 清，调用方计数 blast radius | 高负载必须清时，显式承担失败数 |
 | `AbortAndClear` | 同上 | `transfer_submitted` 则先 `synchronize_transfer_streams` 再 abort | 完整 `fail_all_cleanup` 复用 | 疑似 transaction 卡住、host 拷贝在飞时 |
 
-`scope != All` 时只释放对应层并重建其索引，`ResourceManager::clear_after_program_cleanup` 照常对账；`scope == All` 即 `fail_all_cleanup(Failure)` 的非故障复用（不记 fatal 诊断，只记 admin 操作日志）。
+`scope != All` 时只释放对应层并重建其索引，`ResourceManager::clear_released_entries`
+做选择性对账（slot-role 主信号 + handle-validity 回退，只清已释条目，session_index 按 owner
+选择性擦除）；`scope == All` 即 `fail_all_cleanup(Failure)` 的非故障复用（不记 fatal 诊断，只记 admin 操作日志）。
+按层语义（已实现并验证）：单层零可清内容 = 空操作 + `skip` 计数，不清其他层，不失败整个 op；
+text-only 切片对 backend-less owner 直接 retire slot（`checkpoint_recovery_work` 要求 Catalogued
+槽必有 KV bundle，否则下次 admission 500）。
 
 ## 4. 前置条件（worker 持 `execution_mutex_` 下逐项断言，任一不满足按模式拒绝/中止）
 
@@ -71,14 +78,16 @@ struct CacheClearCmd {
 
 ```
 POST /v1/admin/cache/clear
-  Body: {"scope":["device_main","host_kv","host_state","shared_prefix","continuation","anchors"],
+  Body: {"scope":["device_main","backend","host_kv","host_state","shared_prefix","continuation","anchors","all"],
          "mode":"try_idle|drain_and_fail|abort_and_clear", "dry_run":false}
-  → 202 {"op_id":123, "state":"queued"}
-  → 409 {"error":"busy", "in_flight":2, "materializing":false}（TryIdle 忙时）
-GET /v1/admin/cache/clear/{op_id}
+  → 202 {"clear_id":123, "state":"queued"}
+  → 409 {"error":"busy", "in_flight":2, "materializing":false}（TryIdle 忙时，轮询 GET 时返回）
+GET /v1/admin/cache/clear/{clear_id}
   → {"state":"done", "kv_before":363648, "kv_after":0, "host_before":9350995968,
-     "host_after":0, "duration_ms":812, "failed_requests":0}
+     "host_after":0, "duration_ms":812, "failed_requests":0,
+     "detail":"scoped release mask=0x01 rel=[...] skip=[...]"}（按层清时 detail 为 per-layer 明细）
 ```
+注：字段名为 `clear_id`（2026-10-14 由 `op_id` 改名，与 llmux 别名无关，纯引擎 admin 任务编号）。
 
 鉴权复用现有 `api_key` 门；`dry_run=true` 只返回“若执行会走哪条路、影响多少 lane”，不清。
 
@@ -95,15 +104,27 @@ GET /v1/admin/cache/clear/{op_id}
 - 新增“在线清空（仅空闲，忙则拒绝）”→ `mode=try_idle`；高级折叠页放 `drain/abort` 两档，二次确认框写明“将失败 N 个在途请求”。
 - 按钮旁显示最近一次 op 结果（before→after、耗时、failed 数），不再只有一个 toast。
 
-## 8. 隔离验证矩阵（GPU4，逐项过才谈生产）
+## 8. 隔离验证矩阵（GPU4，✅ 2026-10-15 全绿，证据 `~/matrix-evidence-2026-10-15/`）
 
-1. idle 清：`kv 227k→0, host X→0`，召回同 prompt=0%（证明真清），`requests_processing` 全程 0。
-2. 满载 TryIdle：冷 117k prefill 中发清→409 busy，无状态变化。
-3. DrainAndFail：冷 65k + 热排队时发清→在途按 Overloaded 失败可计数，清后新请求 0% 冷起。
-4. AbortAndClear：构造 transfer 在飞（大 host 召回中）发清→同步后清，无一半状态。
-5. 并发请求：清操作期间新提交排队不插队、不丢（pending 语义与现有 admission 一致）。
-6. 性能：清操作 p50/p99 耗时，`restart 40s` vs 在线清 `<2s idle / <5s drain` 对照。
-7. 回归：现有形状探针（stable 100% / append 99.9% / tools+1 0%）清后重跑，确认索引重建无损坏。
+| # | 场景 | 结果（实测） | 证据 |
+|---|---|---|---|
+| 1 | idle 清 | `kv 30016→0`，同 prompt 重发 0%，槽归零 | 前序 |
+| 2 | 满载 TryIdle | 冷 117k prefill 中发清→409 busy 无副作用；闲后 `147136→0` | 前序 |
+| 3 | DrainAndFail | 冷 65k + 热排队双双 429 可重试，`failed=2=快照在途数`，`kv 65088→0`，后继 0% 真空 | `drain5.out` |
+| ④-a | abort idle | `done kv 234240→0 failed=0`（非流式 recall，abort 实际打在 idle） | `abort4.out` |
+| ④-b | abort prefill 在飞 | `in_flight=1 failed=1`，在途冷请求 429 计数，`kv 234240→0`，槽归零 | `abort5.out` |
+| ④ | transfer 真在飞 | 降级接受：restore 窗口 ~0.5s 抓不住，如实记未覆盖；sync 顺序经代码走读确认（`fail_all_cleanup` 内 `transfer_submitted→synchronize` 先行） | 走读记录 |
+| ⑤-B | 并发不丢 | drain 启动时刻已在途 small-0 计入 fail（`failed=2`）；之后 small-1/2 正常 done 且顺序一致 | `conc5.out` |
+| ⑤-C | TryIdle 边界 | 忙时 `202→轮询 409 busy`，排队中小请求正常执行；闲后真空 `65472→0` | `tryidle5.out` |
+| 7 | 形状回归 | t1 0% / identical 100% / append 99.9% / tools+1 0% / system 0%，drain 后复跑干净轮索引健康 | `shape-clean2.out` |
+| 按层 | 7 层逐层清 | device_main `rel=[1,...] kv 39104→0` 后继 0%；continuation `rel=[...,1,..] kv→0` 后继 0%；backend/host_kv/host_state/shared/anchors 如实 skip，后继 100% 保持；全程零 500；显式 7bit mask 走 scoped 路径，`0x7f` 走 `fail_all_cleanup` | `scoped7c.out` + `admin-clear-scoped3.log` |
+| 6 | 耗时对照 | idle 清 ×10：worker 全 `0ms`，客户端 p50 `202ms`/p99 `205.5ms`；abort idle ×5 全 `0ms`；restart ×3：`13.4/12.2/13.4s`（weights 7.8/6.9/7.7s）。对照约 **65 倍**；restart 全程不可用。注：设计初稿 `40s` 为旧传说数字，以实测 `~13s` 为准 | `perf6.out` + `restart-baseline-{1,2,3}.log` |
+
+途中修的 bug（隔离分支，已验证）：
+1. drain 块丢 `materializing_` 请求：`materializing_.reset()` 直接丢弃未 fail——对照 `fail_all_locked` 补取出→fail→计数。
+2. 计数器滞后一个 op：`++cache_clear_total_` 在 mid-op `publish_runtime_stats()` 快照之后——改为终态递增后重 publish。
+3. 按层 reconcile 误杀：KV 占用探针分不清"owner 已释"与"KV 切片已释"——改 slot-role 主信号 + handle-validity 回退；session_index 改按 owner 选择性擦除。
+4. text-only 切片僵尸 owner：backend-less owner释 text 后成无 bundle Catalogued，下次 admission 500——改为直接 retire slot（`scoped_release.cpp` INVARIANT 注释）。
 
 ## 9. 风险与拒绝理由
 
