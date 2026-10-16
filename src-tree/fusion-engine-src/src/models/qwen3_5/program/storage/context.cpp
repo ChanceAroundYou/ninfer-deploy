@@ -1793,15 +1793,18 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
     // with NINFER_TERNARY_KVMEM_SCORE unset nothing is published, this block is skipped, and the
     // engine must reproduce the old readings exactly (the disjoint arm goes back to its pre-fix 4/6).
     {
-        // B06: read THIS sequence's probe. The probe is per-lane because it is written by this
-        // sequence's own prefill round and read back here for the same sequence; a process-global
-        // probe let a concurrent prefill on another lane overwrite the ranking between the two.
-        const bool owned = ops::detail::kvmem_lrfu_enabled() && sequence.kvmem_score_workspace;
-        const auto& probe = owned ? *sequence.kvmem_score_workspace
-                                  : ops::detail::kvmem_score_probe(sequence.lane);
-        const std::vector<std::int32_t>& kept = probe.kept;
-        const std::vector<float>& scores = probe.score_host;
-        const std::int32_t scored = probe.scored_n_blocks;
+        // B06 + (2026-10-16): read THIS sequence's probe -- the one the scorer wrote. It is owned by
+        // the sequence (prefill binds it unconditionally), so a sequence that has not scored has no
+        // probe, and there is deliberately nothing to fall back to: the old fallback was a process-
+        // resident thread_local, i.e. the previous request on this lane, and reading it here would
+        // restore the pages THAT request asked for. That is the silent wrong retrieval this whole
+        // instrument exists to remove, so an absent probe falls through to the lexical path below.
+        const ops::detail::KvMemScoreProbe* probe = sequence.kvmem_score_workspace.get();
+        static const std::vector<std::int32_t> no_blocks;
+        static const std::vector<float> no_scores;
+        const std::vector<std::int32_t>& kept = probe != nullptr ? probe->kept : no_blocks;
+        const std::vector<float>& scores = probe != nullptr ? probe->score_host : no_scores;
+        const std::int32_t scored = probe != nullptr ? probe->scored_n_blocks : 0;
         if (!kept.empty() && scored > 0 && !scores.empty()) {
             std::vector<std::pair<float, std::uint32_t>> ranked;
             ranked.reserve(kept.size());

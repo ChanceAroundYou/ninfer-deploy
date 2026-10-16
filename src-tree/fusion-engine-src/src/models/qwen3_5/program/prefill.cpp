@@ -264,11 +264,16 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                     ? 0U
                                     : request_plan.summary.effective_output_tokens - 1U));
     try {
+        // The score probe is owned by the SEQUENCE, not by the LRFU feature. It is where the retrieval
+        // scorer publishes this chunk's selection and where ProgramImpl::select_retrieval_pages reads
+        // it back for the same sequence, so it has to exist whenever a sequence does. Creating and
+        // binding it only when LRFU was on is what left the off-path reading a process-resident
+        // thread_local probe -- i.e. the previous request that ran on this lane (2026-10-16).
+        sequence.kvmem_score_workspace = std::make_shared<ops::detail::KvMemScoreProbe>();
+        ops::detail::kvmem_score_bind(lane, sequence.kvmem_score_workspace, &sequence.lrfu);
         if (ops::detail::kvmem_lrfu_enabled()) {
-            sequence.kvmem_score_workspace = std::make_shared<ops::detail::KvMemScoreProbe>();
             ops::detail::kvmem_lrfu_round_begin(sequence.lrfu, lane_epochs[lane],
                                                std::move(retrieval_history));
-            ops::detail::kvmem_score_bind(lane, sequence.kvmem_score_workspace, &sequence.lrfu);
             std::fprintf(stderr, "[lrfu] begin lane=%u token=%llu base_round=%llu source=%s\n",
                          lane, static_cast<unsigned long long>(sequence.lrfu.token),
                          static_cast<unsigned long long>(sequence.lrfu.preview.ks_round),
@@ -1185,10 +1190,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.initial_mtp_extent,
             dflash_host_ingress,
             sequence.lane};
-        if (ops::detail::kvmem_lrfu_enabled()) {
-            ops::detail::kvmem_score_bind(sequence.lane, sequence.kvmem_score_workspace,
-                                          &sequence.lrfu);
-        }
+        ops::detail::kvmem_score_bind(sequence.lane, sequence.kvmem_score_workspace,
+                                      &sequence.lrfu);
         const auto public_tokens =
             static_cast<std::size_t>(dimension(parameters.model.resources().public_token_count));
         if (request.first_token_top_logprobs != 0) {

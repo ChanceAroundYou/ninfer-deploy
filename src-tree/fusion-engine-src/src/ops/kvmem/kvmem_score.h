@@ -220,12 +220,25 @@ struct KvMemScoreProbe {
     bool         logged_action_span = false;  // 动作区生效只喊一次（"行为变了"的证据行）
 };
 
-// B06: one probe PER LANE. The probe carries the score buffer, the kept block set and the
-// query-span state, so a process-wide probe let one sequence's decode read another sequence's
-// ranking -- the silent wrong retrieval this whole instrument exists to remove. `lane` is the
-// SequenceState::lane the request was admitted on; it is stable for the sequence's lifetime.
+// B06 + (2026-10-16): one probe PER LANE, owned BY THE SEQUENCE. The probe carries the score buffer,
+// the kept block set and the query-span state, so a process-wide probe let one sequence's decode read
+// another sequence's ranking -- the silent wrong retrieval this whole instrument exists to remove.
 //
-// Lane 0 is byte-for-byte the old single probe, so --max-concurrency 1 is unchanged.
+// ★ The B06 fix went process-global -> per-lane, which fixes CONCURRENCY but not SUCCESSION: two
+//   requests that are admitted on lane 0 one after the other share a lane. A per-lane probe that
+//   nothing owns is therefore still shared between them, and the contract on KvMemScoreProbe::kept
+//   ("a round that did not score keeps the previous selection") then reads as "keeps the PREVIOUS
+//   SEQUENCE's selection" -- the same silent wrong retrieval, one request later.
+//
+//   So the probe has exactly one owner, SequenceState::kvmem_score_workspace, and this accessor
+//   reports the ABSENCE of a binding instead of inventing one. It used to fall back to a process-
+//   resident `thread_local` probe, which is the defect: that object outlives every sequence and is
+//   never reset, so the fallback WAS the cross-sequence state. Returning a pointer makes "no sequence
+//   is bound here" a thing callers must handle rather than a thing they silently inherit.
+//
+//   The `local` shared_ptr is a LIFETIME guard, not a cache -- it holds a reference so an unbind on
+//   another thread cannot destroy the probe while this thread is reading it. It does not avoid the
+//   lock (the lock is taken on every call either way).
 //
 // No bounds check here, unlike mean_k_index_for: this accessor is on noexcept paths, and the lane is
 // already provably in range -- startup.cpp:1024 throws unless max_concurrency <= kMaximumConcurrency,
@@ -240,16 +253,17 @@ inline KvMemScoreBindingRegistry& kvmem_score_binding_registry() {
     return registry;
 }
 
-inline KvMemScoreProbe& kvmem_score_probe(std::uint32_t lane) {
+// The probe bound to `lane`, or nullptr when no sequence is bound there. Callers must treat nullptr as
+// "not scoring", never as "use something else".
+inline KvMemScoreProbe* kvmem_score_probe(std::uint32_t lane) noexcept {
     static thread_local std::array<std::shared_ptr<KvMemScoreProbe>,
                                     ninfer::kMaximumConcurrency> local;
-    static thread_local std::array<KvMemScoreProbe, ninfer::kMaximumConcurrency> fallback;
     auto& registry = kvmem_score_binding_registry();
     {
         std::lock_guard lock(registry.mutex);
         local[lane] = registry.bound[lane];
     }
-    return local[lane] != nullptr ? *local[lane] : fallback[lane];
+    return local[lane].get();
 }
 
 inline void kvmem_score_bind(std::uint32_t lane,
@@ -265,27 +279,14 @@ inline void kvmem_score_unbind(std::uint32_t lane,
                                const std::shared_ptr<KvMemScoreProbe>& probe) noexcept {
     auto& registry = kvmem_score_binding_registry();
     std::lock_guard lock(registry.mutex);
-    if (registry.bound[lane] == probe) { registry.bound[lane].reset(); }
-}
-
-// LOCAL (2026-10-02, the caller step): the block ids selected by the most recent kvmem_score_finish().
-// ASCENDING (kvmem_select.h:30-33 -- never score order). Empty = no fresh selection, see the note on
-// KvMemScoreProbe::kept. Read by ProgramImpl::select_retrieval_pages as the ring's `preferred` set.
-inline const std::vector<std::int32_t>& kvmem_score_selected_blocks(std::uint32_t lane) noexcept {
-    return kvmem_score_probe(lane).kept;
-}
-
-// The per-block scores behind that selection: index i is the score of block i (first_block is 0 at our
-// single call site). Published because the ring's restore budget is SMALLER than the selector's
-// default budget, so the caller has to rank the kept set again and take its top `budget` -- truncating
-// the ascending id list would silently keep the OLDEST blocks instead of the best ones.
-inline const std::vector<float>& kvmem_score_host_scores(std::uint32_t lane) noexcept {
-    return kvmem_score_probe(lane).score_host;
-}
-
-// How many blocks the published scores describe ([0, n)). Zero = nothing to read.
-inline std::int32_t kvmem_score_scored_blocks(std::uint32_t lane) noexcept {
-    return kvmem_score_probe(lane).scored_n_blocks;
+    if (registry.bound[lane] == probe) {
+        // Drop the round pointer with the binding. The probe can outlive its sequence (the `local`
+        // reference above keeps it alive for a reader that is mid-call), and the round is a member of
+        // that sequence -- leaving it set would leave a dangling pointer on a probe that still looks
+        // bound to whoever is holding it.
+        if (probe != nullptr) { probe->lrfu = nullptr; }
+        registry.bound[lane].reset();
+    }
 }
 
 // ---- ①b 绝对 query span（D-12, 2026-10-02）------------------------------------------------------
@@ -301,7 +302,9 @@ inline std::int32_t kvmem_score_scored_blocks(std::uint32_t lane) noexcept {
 // 说明跳过的是哪些层、以及为什么（那些槽里还是上一轮的字节）。
 inline void kvmem_score_set_harvest_layers(std::uint32_t lane, std::int32_t harvested,
                                             std::int32_t total) noexcept {
-    KvMemScoreProbe& p     = kvmem_score_probe(lane);
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    KvMemScoreProbe& p     = *probe;
     p.harvest_layers       = harvested;
     p.harvest_layers_total = total;
 }
@@ -309,15 +312,18 @@ inline void kvmem_score_set_harvest_layers(std::uint32_t lane, std::int32_t harv
 // begin < 0 = 未知 ⇒ 回落 QUERY_TAIL 尾窗规则：那既是既有行为，也是这条改动的**负控**。
 inline void kvmem_score_set_query_span(std::uint32_t lane, std::int32_t begin,
                                        std::int32_t end) noexcept {
-    KvMemScoreProbe& p = kvmem_score_probe(lane);
-    p.abs_query_begin = begin;
-    p.abs_query_end   = end;
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    probe->abs_query_begin = begin;
+    probe->abs_query_end   = end;
 }
 
 // 本 chunk 的**绝对** token 起点（= 该序列此刻已写入 KV 的 token 数，即 text_kv_base）。只有它已知，
 // 绝对 span 才能落到 chunk 内的局部下标上；未知则同样回落尾窗。
 inline void kvmem_score_set_chunk_origin(std::uint32_t lane, std::int32_t abs_begin) noexcept {
-    kvmem_score_probe(lane).abs_chunk_begin = abs_begin;
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    probe->abs_chunk_begin = abs_begin;
 }
 
 // ---- ★ G3 动作区 query span：开关、尾窗读数与发布口（action_* 段，2026-10-15）-------------------
@@ -345,17 +351,19 @@ inline std::int32_t kvmem_action_tail_n(std::int32_t maxq) noexcept {
 // 发布方（frontend / prefill driver）负责"每个 chunk 都重发一次"这条纪律，见 prefill.cpp。
 inline void kvmem_score_set_action_span(std::uint32_t lane, std::int32_t begin, std::int32_t end,
                                         const char* src) noexcept {
-    KvMemScoreProbe& p = kvmem_score_probe(lane);
-    p.action_begin = begin;
-    p.action_end   = end;
-    p.action_src   = src != nullptr ? src : "none";
-    p.action_fresh = begin >= 0 && end > begin;
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    probe->action_begin = begin;
+    probe->action_end   = end;
+    probe->action_src   = src != nullptr ? src : "none";
+    probe->action_fresh = begin >= 0 && end > begin;
 }
 
 inline void kvmem_score_fail(std::uint32_t lane, const char* why) noexcept {
-    KvMemScoreProbe& p = kvmem_score_probe(lane);
-    p.failed = true;
-    p.armed  = false;
+    if (KvMemScoreProbe* probe = kvmem_score_probe(lane); probe != nullptr) {
+        probe->failed = true;
+        probe->armed  = false;
+    }
     std::fprintf(stderr, "kvmem_score: DISABLED (%s)\n", why);
 }
 
@@ -369,7 +377,9 @@ inline void kvmem_score_begin(std::uint32_t lane, std::int32_t requested_capacit
                               std::int32_t n_heads, std::int32_t n_kv_heads,
                               std::int32_t head_dim, cudaStream_t stream) noexcept {
     if (!kvmem_score_enabled()) { return; }
-    KvMemScoreProbe& p = kvmem_score_probe(lane);
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    KvMemScoreProbe& p = *probe;
     if (p.failed) { return; }
 
     // LOCAL (D-12, 2026-10-02): a round that ends up NOT scoring -- because its chunk does not contain
@@ -442,7 +452,9 @@ inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const 
                                    std::int32_t n_query_tokens, std::int32_t chunk_tokens,
                                    cudaStream_t stream) noexcept {
     if (!kvmem_score_enabled()) { return; }
-    KvMemScoreProbe& p = kvmem_score_probe(lane);
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    KvMemScoreProbe& p = *probe;
     if (!p.armed || p.failed) { return; }
     if (n_query_tokens <= 0 || p.n_blocks <= 0) { return; }
 
@@ -653,7 +665,9 @@ inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const 
 inline void kvmem_score_finish(std::uint32_t lane, const char* label,
                                std::int32_t query_tokens, cudaStream_t stream) noexcept {
     if (!kvmem_score_enabled()) { return; }
-    KvMemScoreProbe& p = kvmem_score_probe(lane);
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    KvMemScoreProbe& p = *probe;
     if (!p.armed || p.failed || p.n_blocks <= 0) { return; }
     p.armed = false;
     // ★ G3 消费即焚（2026-10-15）：本 chunk 已经把动作 query 用过（accumulate 逐层读的是同一个
@@ -815,8 +829,9 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
 //   LRFU 开时按 lrfu_score 重排 kept；关时恒 0（调用方按当轮分重排，逐位旧行为）。
 //   kept 仍由当轮 kvmem_select_blocks 产生 —— 这里只读、不改 kept（D1 的另一半）。
 inline float kvmem_score_lrfu_score(std::uint32_t lane, std::int32_t block) noexcept {
-    const KvMemScoreProbe& p = kvmem_score_probe(lane);
-    if (block < 0) { return 0.0f; }
+    const KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (block < 0 || probe == nullptr) { return 0.0f; }
+    const KvMemScoreProbe& p = *probe;
     return p.lrfu != nullptr ? kvmem_lrfu_score(p.lrfu->preview, static_cast<std::size_t>(block))
                              : 0.0f;
 }
@@ -844,7 +859,8 @@ inline float kvmem_score_rank_key(std::uint32_t lane, const std::vector<float>& 
 
 // LRFU 已提交轮数（KS 轨迹审计：换问后旧块衰减 0.9→0.45 量级的抽查口）。
 inline std::uint64_t kvmem_score_lrfu_round(std::uint32_t lane) noexcept {
-    const auto* round = kvmem_score_probe(lane).lrfu;
+    const KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    const KvMemLrfuRound* round = probe != nullptr ? probe->lrfu : nullptr;
     return round != nullptr ? round->preview.ks_round : 0;
 }
 
@@ -853,7 +869,9 @@ inline void kvmem_score_dump_if_requested(std::uint32_t lane, const char* label)
     if (!kvmem_score_enabled()) { return; }
     const char* path = std::getenv("NINFER_TERNARY_KVMEM_SCORE_DUMP");
     if (path == nullptr || path[0] == '\0') { return; }
-    KvMemScoreProbe& p = kvmem_score_probe(lane);
+    KvMemScoreProbe* probe = kvmem_score_probe(lane);
+    if (probe == nullptr) { return; }
+    KvMemScoreProbe& p = *probe;
     if (p.n_blocks <= 0) { return; }
     FILE* f = std::fopen(path, "ab");
     if (f == nullptr) { return; }

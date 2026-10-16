@@ -1,6 +1,12 @@
 ninfer_add_test(ninfer_kvmem_lrfu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_kvmem_lrfu.cpp")
 
+
+# Who owns the score probe. Needs the CUDA headers kvmem_score.h pulls in (via ninfer_ops), but
+# launches nothing, so it runs wherever the suite does.
+ninfer_add_test(ninfer_kvmem_score_binding_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_kvmem_score_binding.cpp"
+  LIBRARIES ninfer_ops)
 set(ninfer_op_tests
   add_bias
   gelu
