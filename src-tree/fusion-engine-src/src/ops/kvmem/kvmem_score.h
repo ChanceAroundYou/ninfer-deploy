@@ -53,6 +53,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -196,7 +197,27 @@ struct KvMemScoreProbe {
     // Program-owned LRFU state is separate from the instantaneous score_host.
     // finish only accumulates eligible coverage; Program accepts or aborts it.
     KvMemLrfuRound* lrfu = nullptr;  // non-owning, bound to the active Program sequence
-
+    // ---- ★ G3 动作区 query span（action_* 段，2026-10-15）----------------------------------------
+    //   动作区 = **上一轮 assistant 输出的尾部** N token（上游可行性排序里的口径 2，见
+    //   kvmem-actkv/docs/dev-actkv-swap-redesign.md §2.3）。它比 D-12 的"最后一轮 user span"更贴论文：
+    //   user span 是**观测**（问句），action span 是**动作**（上一轮代理真正产出的东西，tool-call
+    //   轨迹就落在这里）——上游原文："当前 last-user span 是观测不是动作，不能直接当 action region"。
+    //   优先级：action（新鲜、一次性、≤MAXQ）> D-12 绝对 user span > QUERY_TAIL 尾窗。
+    //   **消费即焚**：`action_fresh` 在**本 chunk 收尾时**清掉（finish()），不是每层清 —— accumulate
+    //   是逐层调用的，每层都读同一个 span，逐层清会让第 2 层起就丢掉动作 query（那是个静默的半失效）。
+    //   清的理由是安全不是洁癖：陈旧的动作 query 是**静默错答案**类故障（拿上一问的检索结果回答这一问）。
+    //   跨请求的泄漏另有一道闸：driver 每个 chunk 都重发一次（prefill.cpp，与 D-12 同形），本请求没有
+    //   动作区就显式发 -1 覆盖，绝不继承。
+    std::int32_t action_begin  = -1;
+    std::int32_t action_end    = -1;
+    bool         action_fresh  = false;   // 已发布、本 chunk 未被消费
+    std::int32_t action_tail_n = 0;       // 最近一次**真正生效**的动作尾窗长度（SELECT 行审计）
+    const char*  action_src    = "none";  // "prompt_assistant"（精确）/ "ledger_tail"（兜底）
+    // 本 chunk 的 query span 落在哪一档上（SELECT 行 span_mode= 审计）。这是**读数**而不是推导：
+    // 旧口径 `abs_query_begin >= 0 ? "abs" : "tail"` 只说明"发过一个绝对 span"，说不出它是否被用上
+    // （交集为空/超 MAXQ 时它会回落尾窗，却仍打成 abs —— 那正是 G3 要能区分的第一件事）。
+    const char*  span_mode      = "tail";
+    bool         logged_action_span = false;  // 动作区生效只喊一次（"行为变了"的证据行）
 };
 
 // B06: one probe PER LANE. The probe carries the score buffer, the kept block set and the
@@ -297,6 +318,38 @@ inline void kvmem_score_set_query_span(std::uint32_t lane, std::int32_t begin,
 // 绝对 span 才能落到 chunk 内的局部下标上；未知则同样回落尾窗。
 inline void kvmem_score_set_chunk_origin(std::uint32_t lane, std::int32_t abs_begin) noexcept {
     kvmem_score_probe(lane).abs_chunk_begin = abs_begin;
+}
+
+// ---- ★ G3 动作区 query span：开关、尾窗读数与发布口（action_* 段，2026-10-15）-------------------
+//
+// 开关 NINFER_TERNARY_KVMEM_ACTION_SPAN（默认**关**）。默认关不是保守，是纪律：这一档改变的是
+// "拿什么去检索"，它必须能在同一条 fixture 上开关两臂对照；关着时逐位回落到 D-12/QUERY_TAIL，
+// 即本改动的**负控**。
+// ⚠️ 必须走 kvmem_score_env_flag（**不是** env_i32）：`=0` 要读成"关"这个明确表态，而 env_i32 把
+// 0/负一律当"未设"⇒ 回落默认值 ⇒ 负控永不生效（B25 教训，2026-10-07 实测过同型缺陷）。
+inline bool kvmem_action_span_enabled() noexcept {
+    static const bool on = kvmem_score_env_flag("NINFER_TERNARY_KVMEM_ACTION_SPAN", false);
+    return on;
+}
+
+// 动作尾窗 NINFER_TERNARY_KVMEM_ACTION_TAIL_N（默认 128）。它说的是"上一轮 assistant 输出的**尾部**
+// 多少 token 算动作区"，不是"整段输出"。上界收到 MAXQ：动作区的定义就是 ≤ MAXQ 的一段 —— 比 MAXQ
+// 长它就不再是"靠近下一个动作的那一截"，而退化成整段输出（那正是上游警告过的、把观测当动作的错法）。
+inline std::int32_t kvmem_action_tail_n(std::int32_t maxq) noexcept {
+    const std::int32_t n = kvmem_score_env_i32("NINFER_TERNARY_KVMEM_ACTION_TAIL_N", 128);
+    return (maxq > 0 && n > maxq) ? maxq : n;
+}
+
+// 发布本请求的动作区（**绝对** token 下标，与 kvmem_score_set_query_span 同一坐标系）。
+// begin < 0 = 本请求没有动作区 ⇒ `action_fresh` 保持 false，打分时自然落到 D-12/QUERY_TAIL 那一档。
+// 发布方（frontend / prefill driver）负责"每个 chunk 都重发一次"这条纪律，见 prefill.cpp。
+inline void kvmem_score_set_action_span(std::uint32_t lane, std::int32_t begin, std::int32_t end,
+                                        const char* src) noexcept {
+    KvMemScoreProbe& p = kvmem_score_probe(lane);
+    p.action_begin = begin;
+    p.action_end   = end;
+    p.action_src   = src != nullptr ? src : "none";
+    p.action_fresh = begin >= 0 && end > begin;
 }
 
 inline void kvmem_score_fail(std::uint32_t lane, const char* why) noexcept {
@@ -425,7 +478,45 @@ inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const 
                                 p.abs_chunk_begin >= 0 && chunk_tokens > 0 &&
                                 !kvmem_score_env_flag("NINFER_TERNARY_KVMEM_SCORE_SPAN_OFF", false);
     bool span_applied = false;
-    if (abs_span_known) {
+    // ★ G3 动作区 query（action_* 段，2026-10-15）：**最高优先**的一档，先于 D-12 绝对 user span。
+    //   论文 §5.1 的前提是"动作导向"：检索应当由**上一轮代理做出的动作**发起，而不是由题面发起
+    //   （上游原文：不要把 last-user span 当 action region，那是观测不是动作）。tool-call 轨迹是
+    //   这条改动的**主场**：问句与历史 tool 结果词面不相交时，只有动作区能把它捞回来。
+    //   与 D-12 段同形的三条口径，逐条对齐以免出现"两个绝对 span 两套规矩"：
+    //     · 交集为空 ⇒ **不**在这一档生效，落到下一档（绝不比"什么都不打分"差）；
+    //     · 交集比 MAXQ 长 ⇒ 同样不生效（见 kvmem_action_tail_n 的上界说明，正常不可达）；
+    //     · 生效时旁路后面所有档（它就是本 chunk 的 query）。
+    //   max(0,·) 底线（上游 P0-6 "有符号 cosine 的 KS 永不自愈"）：本引擎的检索分**结构上非负** ——
+    //   phase2 每项都是 `expf(best - gm) * (head_w / gs)` 后 atomicAdd（kvmem_retrieve_launch.cu:275/288），
+    //   而 gs > 0 有显式守卫、head_w = 1/(L*H) > 0。故 KS 累积（kvmem_lrfu.h）逐轮恒非负，论文的
+    //   非负前提在这里是**结构性成立**的，不需要（也不该）再加一个假装在修 P0-6 的 clamp。
+    //   这条不变量不靠断言活着：finish() 的 SELECT 行把 min_score= 打出来，每轮可核；
+    //   哪天内核换成有符号量（例如真改成 cosine），min_score<0 会当场现形而不用等 KS 烂掉。
+    bool action_applied = false;
+    if (kvmem_action_span_enabled() && p.action_fresh && p.action_begin >= 0 &&
+        p.action_end > p.action_begin && p.abs_chunk_begin >= 0 && chunk_tokens > 0) {
+        const std::int32_t local_begin = p.action_begin - p.abs_chunk_begin;
+        const std::int32_t local_end   = p.action_end - p.abs_chunk_begin;
+        const std::int32_t first       = local_begin > 0 ? local_begin : 0;
+        const std::int32_t last        = local_end < chunk_tokens ? local_end : chunk_tokens;
+        if (last > first && (last - first) <= maxq) {
+            span_begin      = first;
+            span_tokens     = last - first;
+            span_applied    = true;
+            action_applied  = true;
+            p.action_tail_n = last - first;
+            p.span_mode     = "action";
+            if (!p.logged_action_span) {
+                p.logged_action_span = true;
+                std::fprintf(stderr,
+                             "kvmem_score: ACTION query span src=%s abs=[%d,%d) tail_n=%d -> local "
+                             "[%d,%d) of chunk [%d,%d)\n",
+                             p.action_src, p.action_begin, p.action_end, p.action_tail_n, first, last,
+                             p.abs_chunk_begin, p.abs_chunk_begin + chunk_tokens);
+            }
+        }
+    }
+    if (abs_span_known && !action_applied) {
         const std::int32_t local_begin = p.abs_query_begin - p.abs_chunk_begin;
         const std::int32_t local_end   = p.abs_query_end - p.abs_chunk_begin;
         const std::int32_t first       = local_begin > 0 ? local_begin : 0;
@@ -434,6 +525,7 @@ inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const 
             span_begin   = first;
             span_tokens  = last - first;
             span_applied = true;
+            p.span_mode = "abs";
         } else if (!p.logged_span_miss) {
             // LOCAL FIX (2026-10-02, found the hard way): an EMPTY intersection must NOT disable the
             // scorer for the rest of the request. The first version simply returned here -- and because
@@ -456,6 +548,7 @@ inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const 
         const std::int32_t tail = query_tail < chunk_tokens ? query_tail : chunk_tokens;
         span_begin    = chunk_tokens - tail;
         span_tokens   = tail;
+        p.span_mode   = "tail";
     }
     // LOCAL FIX (B05): a span longer than MAXQ used to be skipped outright -- the scorer did nothing
     // for that chunk, the ring fell back to the lexical ranking, and the symptom was a retrieval that
@@ -563,6 +656,13 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
     KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (!p.armed || p.failed || p.n_blocks <= 0) { return; }
     p.armed = false;
+    // ★ G3 消费即焚（2026-10-15）：本 chunk 已经把动作 query 用过（accumulate 逐层读的是同一个
+    //   span），收尾时把新鲜位清掉。粒度是**每 chunk** 而不是每层：accumulate 每层都被调用，逐层清
+    //   会让第 2 层起丢掉动作 query（静默半失效）。清在这里 + driver 每 chunk 重发（prefill.cpp）
+    //   两条一起，才是"陈旧动作 query 绝不参与打分"的完整闸门。
+    //   放在 scored_this_chunk 早退**之前**：没打分的 chunk 同样要把它清掉，否则这个 span 会飘到
+    //   下一个 chunk 去（那是跨轮泄漏，正是要防的那类故障）。
+    p.action_fresh = false;
     // Unscored chunks publish no evidence; Program decides the accept boundary.
     if (!p.scored_this_chunk) {
         return;   // 未打分不改变 LRFU candidate，也不推进轮次。
@@ -594,8 +694,15 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
     }
 
     double sum_score = 0.0;
+    // ★ G3 非负不变量读数（2026-10-15）：min_score 是"KS 永不为负"那条底线的**每轮证据**，不是装饰。
+    //   本引擎的检索分是 softmax 块质量（phase2 全项 expf(·)·(head_w/gs) 后 atomicAdd），结构上非负；
+    //   把它打出来，就把"我们不需要 max(0,·) 补丁"这句话从假设变成可核读数。哪天内核换成有符号量
+    //   （例如真的改成 cosine），这里会当场变负、而不是等几轮之后 KS 烂掉才发现（上游 P0-6 的形态）。
+    double min_score = 0.0;
     for (std::int32_t i = 0; i < p.n_blocks; ++i) {
-        sum_score += static_cast<double>(p.score_host[i]);
+        const double s = static_cast<double>(p.score_host[i]);
+        sum_score += s;
+        if (i == 0 || s < min_score) { min_score = s; }
     }
 
     KvMemSelectConfig scfg;
@@ -618,8 +725,10 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
         // remains available to the immediate selector, but cannot replace query evidence.
         const auto begin = p.abs_chunk_begin + p.query_span_begin;
         const auto end = begin + p.query_span_tokens;
+        const bool action = std::strcmp(p.span_mode, "action") == 0;
         const bool eligible = kvmem_lrfu_coverage_eligible(
-            begin, end, p.abs_query_begin, p.abs_query_end);
+            begin, end, action ? p.action_begin : p.abs_query_begin,
+            action ? p.action_end : p.abs_query_end);
         if (eligible) {
             const bool added = kvmem_lrfu_round_add(*p.lrfu, p.lrfu->token,
                 p.abs_chunk_begin + p.query_span_begin,
@@ -683,18 +792,22 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
                  "sink_kept=%d recent_kept=%d scored_kept=%d candidates=%d kept_range=[%d,%d] "
                  "sum_score=%.3f query_tokens=%d span_mode=%s span_abs=[%d,%d) chunk_abs=%d "
                  "span_local=[%d,%d) oracle_ok=%d scale_floor=%.6f harvest_layers=%d/%d agg=%s "
-                 "lrfu=%s lrfu_round=%llu\n",
+                 "lrfu=%s lrfu_round=%llu min_score=%.6g action_src=%s action_tail_n=%d\n",
                  label, p.n_blocks, scfg.budget_blocks, scfg.sink_blocks, scfg.recent_blocks,
                  sel.kept.size(), runs, skip,
                  sel.kept.size() * static_cast<std::size_t>(p.block_tokens), sel.sink_kept,
                  sel.recent_kept, sel.scored_kept, sel.candidates, kept_first, kept_last, sum_score,
-                 q_used, p.abs_query_begin >= 0 ? "abs" : "tail", p.abs_query_begin, p.abs_query_end,
+                 // span_mode 是**读数**（accumulate 里实际生效的那一档：action/abs/tail），不再是
+                 // `abs_query_begin >= 0` 这种"有没有发过"的推断 —— G3 的验收要求
+                 // `span_mode=action` 可审计，就必须打得出来是哪一档真的赢了。
+                 q_used, p.span_mode, p.abs_query_begin, p.abs_query_end,
                  p.abs_chunk_begin, p.query_span_begin, p.query_span_begin + p.query_span_tokens,
                  (q_used > 0 && sum_score > 0.5 * q_used && sum_score < 2.0 * q_used) ? 1 : 0,
                  static_cast<double>(ops::kvmem_retrieve_scale(p.head_dim)), p.harvest_layers,
                  p.harvest_layers_total,
                  p.last_agg_max ? "max" : "mean", lrfu_on ? "on" : "off",
-                 static_cast<unsigned long long>(lrfu_round));
+                 static_cast<unsigned long long>(lrfu_round), min_score,
+                 p.action_src, p.action_tail_n);
 }
 
 // ---- LRFU 读口（D1）：select_retrieval_pages 内容路的重排键 ------------------------------

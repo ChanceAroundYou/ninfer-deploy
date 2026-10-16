@@ -1096,12 +1096,41 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.query_span_begin = begin;
         result.query_span_end   = end;
     }
-    // Publish unconditionally -- the -1 default included: a request that yields no user turn must CLEAR
-    // a stale span instead of inheriting the previous request's. That inheritance is exactly how a
-    // cached-prefix turn 2 ran on turn 1's prompt-wide span on 2026-10-02 and silently lost the content
-    // ranking. Publishing HERE, in the request path, also covers prefill shapes that never pass through
-    // program/prefill.cpp's driver (e.g. the forced-token suffix prefill in transactions/commit.cpp).
-    kvmem_publish_query_span(result.query_span_begin, result.query_span_end);
+    // LOCAL (G3 action-region query span, 2026-10-15): the ACTION region is the LAST ASSISTANT MESSAGE of
+    // this prompt, published in the same absolute token coordinates as the user span above. The paper's
+    // premise (§5.1) is that retrieval should be driven by the previous turn's ACTION -- what the agent
+    // actually produced -- not by the current turn's question: the last-user span above is an
+    // observation, and treating it as the action region is exactly the substitution the upstream review
+    // warns against ("当前 last-user span 是观测不是动作，不能直接当 action region"). A tool-call
+    // trajectory is where this pays: the question and the historical tool result share no rare words, so
+    // only the action reaches it.
+    //
+    // LAST, not first: the action relevant to the upcoming turn is the most recent output. For the
+    // common cached-prefix turn 2 the prompt is [.., assistant(a1), user(q2), assistant("")], so the last
+    // assistant message with a non-empty body is a1 -- the previous turn's answer.
+    // The message FRAME trim below matches the user-span loop: a trailing "<|im_end|>" and the
+    // "<|im_start|>assistant\n" opener are not part of the action content.
+    for (std::size_t i = message_roles.size(); i-- > 0;) {
+        if (message_roles[i] != ChatRole::Assistant) { continue; }
+        if (!message_boundaries[i] && i != 0) { continue; }
+        if (i + 1 >= message_boundaries.size() || !message_boundaries[i + 1]) { continue; }
+        std::int32_t begin = message_boundaries[i] ? static_cast<std::int32_t>(*message_boundaries[i]) : 0;
+        const std::int32_t end = static_cast<std::int32_t>(*message_boundaries[i + 1]);
+        const std::span<const TokenId> all(result.token_ids);
+        if (begin >= end || end > static_cast<std::int32_t>(all.size())) { continue; }
+        if (impl_->tokenizer->decode_token_bytes(all[static_cast<std::size_t>(begin)]) ==
+            "<|im_start|>") {
+            while (begin < end) {
+                const auto bytes =
+                    impl_->tokenizer->decode_token_bytes(all[static_cast<std::size_t>(begin++)]);
+                if (bytes.find('\n') != std::string_view::npos) { break; }
+            }
+        }
+        if (begin >= end) { continue; }   // frame-only message (an empty assistant turn) -> no action
+        result.action_span_begin = begin;
+        result.action_span_end   = end;
+        break;
+    }
     result.identity.reusable = true;
     result.tap_hints         = prepare_tap_hints(cache_hints, message_boundaries, cache_boundaries,
                                                  engine_tool_marker_index, leading_boundary,

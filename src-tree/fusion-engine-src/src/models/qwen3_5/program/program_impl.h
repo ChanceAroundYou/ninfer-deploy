@@ -446,6 +446,24 @@ struct DecodeGraphFamily {
 // Target model continuation for one logical sequence. This state remains meaningful after the
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
+// LOCAL (G7/G4 ring adaptive budget, 2026-10-15): the gate's observable signal, measured at the moment
+// the retrieval set is CUT to the budget. `ratio` is the boundary gap normalised by the ranking's own
+// internal spacing, so it is dimensionless and self-calibrating -- no absolute score units to tune
+// (retrieval scores are softmax block masses whose magnitude depends on the query length and the block
+// count, so an absolute threshold would silently mean different things on different prompts).
+//   gap      = last kept score - first dropped score   (>= 0: the ranking is sorted descending)
+//   typical  = (top score - last kept) / (kept - 1)    (a typical step inside the kept set)
+//   ratio    = gap / typical
+// A SMALL ratio means the cut is a near-tie: the budget is the binding constraint and the page that
+// should have been admitted ranks just below the line => the paper's "thin margin" signal.
+// `valid == false` means there IS no boundary to be thin (nothing was dropped because the budget covers
+// the whole range, or nothing was kept at all). That is deliberately NOT a growth signal -- with no
+// boundary the budget is not constraining anything, so raising it cannot recover a lost page.
+struct RingBudgetMargin {
+    float ratio = 0.0F;
+    bool  valid = false;
+};
+
 struct SequenceState {
     ops::detail::KvMemLrfuRound lrfu;
     std::shared_ptr<ops::detail::KvMemScoreProbe> kvmem_score_workspace;
@@ -471,6 +489,24 @@ struct SequenceState {
     std::vector<std::uint32_t> ring_keep;
     // Mapped text pages at the last rescore; rescoring only happens when this changes.
     std::uint32_t ring_scored_mapped      = 0;
+    // ---- LOCAL (G7/G4 ring adaptive budget, 2026-10-15) ------------------------------------------
+    //   The paper's §6 budget controller ("α<0 => B' = min(B * scale_up, B_upper)", increase-only,
+    //   checked once per compaction step) ported onto the one signal this engine can actually observe.
+    //   The upstream signal, `llama_kvmem_observe_confidence`, is DEAD CODE with zero callers and could
+    //   never fire even if wired (`active == ceiling` held identically -- review P0-1/P0-2), so it is
+    //   deliberately NOT used. This engine's observable analogue is the retrieval cut's boundary margin:
+    //   a near-tie at the budget line means the budget is what dropped the page (see RingBudgetMargin).
+    //   Lives here, next to ring_keep, because both describe the same retrieval hysteresis.
+    //     budget_cur    = this sequence's current retrieval budget in pages; 0 = seed from the
+    //                     configured budget on first use. INCREASE-ONLY by design (paper §6).
+    //     cooldown_left = reselections still to skip before the gate may grow again. Growth is a
+    //                     per-RESELECTION event, never per-token: the upstream defect (P0-5) was exactly
+    //                     a controller that multiplied on every call, reaching the ceiling in ~5 tokens.
+    //     ring_margin   = the margin the LAST reselection measured; it gates the NEXT one (the signal
+    //                     only exists once a cut has been made).
+    std::uint32_t budget_cur     = 0;
+    std::uint32_t cooldown_left  = 0;
+    RingBudgetMargin ring_margin;
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
@@ -531,6 +567,16 @@ struct RequestControl {
     // The sequence's own output ceiling: the largest frontier its lease may ever cover, so
     // on-demand growth never leases pages the request cannot reach.
     std::uint32_t lease_ceiling = 0;
+    // LOCAL (G3 action-region query span, 2026-10-15): the LEDGER-TAIL fallback for the action region,
+    // captured in start_sequence BEFORE the materialization swap replaces the ledger with this prompt's
+    // own tokens. Before that swap the ledger is the history this request inherited, and for a
+    // cached-prefix continuation its tail is the previous turn's generated output -- the action region.
+    // After the swap the ledger IS the new prompt, so its tail would be the new QUESTION, which is the
+    // observation the paper's §5.1 explicitly says must not be used as the action region.
+    // Only consulted when the prompt carries no assistant message of its own (the exact path is the
+    // last-assistant-message span the frontend publishes); -1/-1 = nothing to fall back to.
+    std::int32_t action_fallback_begin = -1;
+    std::int32_t action_fallback_end   = -1;
     // Set when the Device KV lease cannot be extended any further: the request finishes at the
     // frontier its lease covers with its generation limit reason instead of failing a launch on
     // coverage.
@@ -1657,10 +1703,15 @@ private:
     // LOCAL PROTOTYPE (KVMem-style ring retrieval): rank the pages in [begin, end) by an
     // inverse-document-frequency weighted token overlap with the recent context (the sequence
     // ledger is Host-side), and return the top `budget` page indices in ascending order.
+    // `margin_out`, when non-null, always receives this cut's boundary margin (G7/G4 gate signal), with
+    // `valid == false` when the cut decided nothing -- nothing kept, or nothing dropped because the budget
+    // covered the whole range. The caller must read `valid`, not the ratio: a cleared reading means the
+    // budget was not binding here, so there is no thinness to act on.
     [[nodiscard]] std::vector<std::uint32_t> select_retrieval_pages(const SequenceState& sequence,
                                                                     std::uint32_t begin,
                                                                     std::uint32_t end,
-                                                                    std::uint32_t budget) const;
+                                                                    std::uint32_t budget,
+                                                                    RingBudgetMargin* margin_out) const;
     // LOCAL PROTOTYPE (KVMem-style ring retrieval): bring the selected Host-resident pages back onto
     // the Device (H2D) and re-publish their block-table slots. Returns the pages actually restored.
     [[nodiscard]] std::vector<std::uint32_t>

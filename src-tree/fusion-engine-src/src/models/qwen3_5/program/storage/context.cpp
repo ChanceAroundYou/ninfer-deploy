@@ -1711,6 +1711,54 @@ std::uint32_t proto_kv_neighbor_pages() {
     return reach;
 }
 
+namespace {
+// LOCAL (G7/G4 ring adaptive budget, 2026-10-15): measure how thin the budget's boundary is.
+// `ranked` must be sorted by DESCENDING score and `budget` is how many entries the caller is about to
+// keep. See RingBudgetMargin (program_impl.h) for what the ratio means and why it is normalised.
+// ALWAYS WRITES, and clears `valid` when there is no boundary to measure -- either nothing was kept, or
+// nothing was dropped because the budget covers the whole range. The clearing is the point: in both of
+// those cases the budget line decided nothing, so there is NO margin to read. Keeping a previous
+// reselection's reading there instead would let a razor-thin margin from an earlier chunk authorise
+// growth on prompts where the budget is not binding at all -- the gate would climb on no evidence.
+void ring_measure_margin(
+    const std::vector<std::pair<float, std::uint32_t>>& ranked, std::uint32_t budget,
+    RingBudgetMargin* margin_out) {
+    if (margin_out == nullptr) { return; }
+    const std::size_t cut = std::min<std::size_t>(budget, ranked.size());
+    if (cut == 0 || cut >= ranked.size()) {
+        margin_out->ratio = 0.0F;
+        margin_out->valid = false;
+        return;
+    }
+    const float gap     = ranked[cut - 1].first - ranked[cut].first;   // >= 0: sorted descending
+    const float steps   = static_cast<float>(cut > 1 ? cut - 1 : 1);
+    const float typical = (ranked.front().first - ranked[cut - 1].first) / steps;
+    const float floor_step = 1e-12F;   // guards the division only; it is not a tuned threshold
+    margin_out->ratio = gap / (typical > floor_step ? typical : floor_step);
+    margin_out->valid = true;
+}
+
+// The lexical fallback path scores in double (IDF sums), so it needs its own instantiation rather than a
+// conversion copy -- the fallback is the negative control's own path and must stay untouched numerically.
+void ring_measure_margin(
+    const std::vector<std::pair<double, std::uint32_t>>& ranked, std::uint32_t budget,
+    RingBudgetMargin* margin_out) {
+    if (margin_out == nullptr) { return; }
+    const std::size_t cut = std::min<std::size_t>(budget, ranked.size());
+    if (cut == 0 || cut >= ranked.size()) {
+        margin_out->ratio = 0.0F;
+        margin_out->valid = false;
+        return;
+    }
+    const double gap     = ranked[cut - 1].first - ranked[cut].first;
+    const double steps   = static_cast<double>(cut > 1 ? cut - 1 : 1);
+    const double typical = (ranked.front().first - ranked[cut - 1].first) / steps;
+    const double floor_step = 1e-12;
+    margin_out->ratio = static_cast<float>(gap / (typical > floor_step ? typical : floor_step));
+    margin_out->valid = true;
+}
+} // namespace
+
 // LOCAL PROTOTYPE (KVMem-style ring retrieval): rank the pages that are (or are about to become)
 // Host-resident by lexical overlap with the recent context, and return the top `budget` page
 // indices. The score is an inverse-document-frequency weighted token overlap, which is what makes
@@ -1719,8 +1767,17 @@ std::uint32_t proto_kv_neighbor_pages() {
 std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceState& sequence,
                                                               std::uint32_t begin,
                                                               std::uint32_t end,
-                                                              std::uint32_t budget) const {
+                                                              std::uint32_t budget,
+                                                              RingBudgetMargin* margin_out) const {
     std::vector<std::uint32_t> selected;
+    // Clear on entry so EVERY early return below (no budget, no candidates, empty ledger, empty query)
+    // leaves `valid == false`. Without this, a path that returns before measuring would silently leave
+    // the PREVIOUS reselection's margin in place, and the gate would grow the budget on the strength of a
+    // cut that is no longer the one being made. Only a cut that actually happened sets `valid`.
+    if (margin_out != nullptr) {
+        margin_out->ratio = 0.0F;
+        margin_out->valid = false;
+    }
     if (budget == 0 || end <= begin) { return selected; }
     // ---- LOCAL (KVMem content scoring, 2026-10-02) ---------------------------------------------
     // Prefer the CONTENT ranking when the scorer published one. It ranks pages by a query-conditioned
@@ -1769,6 +1826,7 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
                     return left.first != right.first ? left.first > right.first
                                                      : left.second < right.second;
                 });
+                ring_measure_margin(ranked, budget, margin_out);
                 if (ranked.size() > budget) { ranked.resize(budget); }
                 // D-5: complete the evidence of the pages we keep, in score order, while the budget
                 // lasts. The result is re-sorted below because callers binary-search it
@@ -1833,6 +1891,7 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
     std::sort(scored.begin(), scored.end(), [](const auto& left, const auto& right) {
         return left.first != right.first ? left.first > right.first : left.second < right.second;
     });
+    ring_measure_margin(scored, budget, margin_out);
     if (scored.size() > budget) { scored.resize(budget); }
     selected.reserve(scored.size());
     for (const auto& entry : scored) { selected.push_back(entry.second); }
@@ -2109,6 +2168,63 @@ std::uint32_t proto_env_percent(const char* name, std::uint32_t fallback) {
 std::uint32_t proto_kv_retrieve_share_percent() {
     static const std::uint32_t percent = proto_env_percent("NINFER_KV_RETRIEVE_SHARE", 50U);
     return percent;
+}
+
+// ---- LOCAL (G7/G4 ring adaptive budget, 2026-10-15) ------------------------------------------------
+// Readers for the budget gate. These deliberately do NOT reuse proto_env_pages or the "0 == unset"
+// convention that the older knobs use, for two separate reasons:
+//   * proto_env_pages returns PAGES and treats <=0 as unset. NINFER_KV_RETRIEVE_MAX does want pages and
+//     does treat unset as "gate disabled", so proto_env_pages is exactly right for it (see below).
+//   * SCALEUP/COOLDOWN/MARGIN_MIN are not page counts and 0 is a MEANINGFUL value for COOLDOWN (grow at
+//     every reselection is aggressive but expressible), so reading 0 as "unset" would make a documented
+//     setting unreachable -- the B25 defect class, where a negative control that equals a valid setting
+//     silently falls back to the default and the "off" arm is indistinguishable from the "on" arm.
+// Only a missing or EMPTY variable falls back.
+std::uint32_t proto_env_u32(const char* name, std::uint32_t fallback) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') { return fallback; }
+    const long value = std::strtol(text, nullptr, 10);
+    return value < 0 ? fallback : static_cast<std::uint32_t>(value);
+}
+
+float proto_env_f32(const char* name, float fallback) {
+    const char* text = std::getenv(name);
+    if (text == nullptr || text[0] == '\0') { return fallback; }
+    const double value = std::strtod(text, nullptr);
+    // NaN/Inf must not reach the comparison below: NaN < x is false, which would read as "margin is
+    // fine" and silently pin the gate shut. Fall back to the default instead of trusting the parse.
+    if (!std::isfinite(value) || value < 0.0) { return fallback; }
+    return static_cast<float>(value);
+}
+
+// B_upper: the ceiling the gate may grow the retrieval budget to, in PAGES. UNSET (or <= 0) means the
+// gate is DISABLED and the budget is bit-for-bit what it was before this change -- that is this
+// feature's negative control, and it is the shipping default.
+std::uint32_t proto_kv_retrieve_max_pages() {
+    static const std::uint32_t pages = proto_env_pages("NINFER_KV_RETRIEVE_MAX");
+    return pages;
+}
+
+// Growth factor per gate firing (paper §6 `scale_up`). 1 is legal and means "never grow", which makes
+// it a second, independent way to disable the gate without unsetting B_upper.
+std::uint32_t proto_kv_retrieve_scaleup() {
+    static const std::uint32_t value = proto_env_u32("NINFER_KV_RETRIEVE_SCALEUP", 2U);
+    return value;
+}
+
+// Reselections to skip after a growth (paper §6 cooldown; upstream review P0-5 asks for exactly this).
+std::uint32_t proto_kv_retrieve_cooldown() {
+    static const std::uint32_t value = proto_env_u32("NINFER_KV_RETRIEVE_COOLDOWN", 3U);
+    return value;
+}
+
+// Margin threshold, in units of the ranking's own internal spacing (see RingBudgetMargin). The default
+// 1.0 reads as: "the gap at the budget line is smaller than a typical step inside the kept set", i.e.
+// the cut is a near-tie. That is the paper's thin-margin condition, expressed without inventing an
+// absolute score scale -- and it is why this threshold needs no per-model tuning.
+float proto_kv_retrieve_margin_min() {
+    static const float value = proto_env_f32("NINFER_KV_RETRIEVE_MARGIN_MIN", 1.0F);
+    return value;
 }
 
 // LOCAL PROTOTYPE (KVMem-style ring): the retrieval mask IS the Device-resident set. Pages past
@@ -2478,6 +2594,70 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
                              text_total, pool, budget, sink_pages, kRestoreSlackPages);
             }
         }
+        // ---- LOCAL (G7/G4 ring adaptive budget, 2026-10-15): the paper's §6 gate, on this engine's
+        // ---- observable signal. ----------------------------------------------------------------------
+        // THE PAPER'S RULE, kept as written: "α<0 ⇒ B' = min(B * scale_up, B_upper)", increase-only,
+        // checked once per compaction step, with a cooldown.
+        // WHAT IS *NOT* USED: the upstream signal. `llama_kvmem_observe_confidence` is dead code with
+        // zero callers and could never fire even if wired -- `active == ceiling` held identically, so
+        // multiplying by 1.75 and clamping back to the ceiling returned the same value (review P0-1/P0-2).
+        // Porting it would import a controller that cannot act. The local analogue is the one quantity
+        // this engine actually produces at the decision point: the retrieval cut's BOUNDARY MARGIN
+        // (RingBudgetMargin). A near-tie at the budget line means the budget is what dropped the page.
+        // WHY THE SIGNAL IS MEASURED ONE RESELECTION LATE: the margin only exists once a cut has been
+        // made, and the budget must be known before the cut. So each reselection gates the NEXT one --
+        // which is also what makes the cooldown meaningful (a control loop, not a per-token reflex).
+        // GROWTH IS A PER-RESELECTION EVENT, NEVER PER-TOKEN: see SequenceState::cooldown_left.
+        const std::uint32_t mapped_now = text_kv_addresses->mapped_pages(sequence.kv->text);
+        const bool will_rescore =
+            budget != 0 && mapped_now > sink_pages &&
+            (mapped_now != sequence.ring_scored_mapped || sequence.ring_keep.empty());
+        const std::uint32_t gate_upper = proto_kv_retrieve_max_pages();
+        bool        gate_grew  = false;
+        if (gate_upper != 0) {
+            // Seed on first use: the configured budget IS the initial value. The paper starts well below
+            // B_upper on purpose ("budget_initial 必须显著小于 b_upper") -- and the upstream module was a
+            // permanent no-op precisely because initial == ceiling. Seed-forcing a small start here would
+            // be inventing a number this deployment has no measurement for, so the configured budget
+            // stands as the start and the ceiling only bounds the GROWTH.
+            if (sequence.budget_cur == 0) { sequence.budget_cur = budget; }
+            if (sequence.budget_cur == 0) {
+                // B_upper set but there is no budget to grow from (NINFER_KV_RETRIEVE unset AND the B32
+                // fallback did not fire, so retrieval is off entirely). Say so once, by name, rather than
+                // being a silent no-op -- a shipped switch that quietly does nothing is the exact defect
+                // class this port exists to remove.
+                static bool warned_inert = false;
+                if (!warned_inert) {
+                    warned_inert = true;
+                    std::fprintf(stderr,
+                                 "[ring] gate: NINFER_KV_RETRIEVE_MAX=%u is set but the retrieval budget "
+                                 "is 0 (NINFER_KV_RETRIEVE unset and the auto budget did not fire) -- "
+                                 "the adaptive gate is INERT for this process.\n",
+                                 gate_upper);
+                }
+            } else if (will_rescore) {
+                if (sequence.cooldown_left > 0) {
+                    --sequence.cooldown_left;
+                } else if (sequence.ring_margin.valid &&
+                           sequence.ring_margin.ratio < proto_kv_retrieve_margin_min()) {
+                    const std::uint64_t grown =
+                        static_cast<std::uint64_t>(sequence.budget_cur) *
+                        static_cast<std::uint64_t>(proto_kv_retrieve_scaleup());
+                    const std::uint32_t next = static_cast<std::uint32_t>(
+                        grown < gate_upper ? grown : gate_upper);
+                    if (next > sequence.budget_cur) {
+                        sequence.budget_cur    = next;
+                        sequence.cooldown_left = proto_kv_retrieve_cooldown();
+                        gate_grew              = true;
+                    }
+                }
+            }
+            // The gate only ever RAISES the budget: `budget` keeps its configured value as a floor, and
+            // B_upper caps the grown value, never the configured one. Capping the configured value would
+            // silently override an explicit NINFER_KV_RETRIEVE, which the B32 comment above forbids.
+            const std::uint32_t capped = std::min(sequence.budget_cur, gate_upper);
+            if (capped > budget) { budget = capped; }
+        }
         // ---- P1-a BUDGET LINE (2026-10-05): the pool's split, in one auditable row. --------------
         // WHY: the plan's P1-a asks for "[ring] budgets: skeleton=S, evidence=E, recent=R, free=F
         // (pool P)" so that the NEXT person can see where the KV budget went without reading code.
@@ -2498,16 +2678,47 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
             const std::uint32_t b_evidence = budget < pool - b_skeleton ? budget : pool - b_skeleton;
             const std::uint32_t b_recent   = 0U;   // recency is whatever the request's own frontier maps
             const std::uint32_t b_free     = pool - b_skeleton - b_evidence - b_recent;
+            // ---- LOCAL (G7/G4 gate audit, 2026-10-15): the `gate=` suffix. --------------------------
+            // WHY IT IS PART OF THE SAME ROW: this line is the one place the KV budget's arithmetic is
+            // already made auditable and already sums to the pool. A separate gate line could drift out of
+            // step with it -- the row would say evidence=E while the gate was working on a different E.
+            // Reading it: `gate=off` = NINFER_KV_RETRIEVE_MAX unset, so the adaptive controller never ran
+            // and `evidence` is the configured budget, bit-for-bit the old behaviour (the negative
+            // control). `gate=inert(...)` = the ceiling was set but there is no budget to grow.
+            // `gate=grow|hold cur=N upper=U margin=M cooldown=C` = the controller ran: N is what it is
+            // holding the budget at (and is what `evidence` above was computed from), U the ceiling, M the
+            // boundary margin measured at the PREVIOUS reselection (`n/a` = none measured yet, which is
+            // also the state right after a lane recycle), C how many reselections remain before the gate
+            // may grow again. `grow` marks the reselection that just raised it, so a climb is visible as a
+            // staircase of grow lines with rising N.
+            char gate_suffix[192];
+            if (gate_upper == 0) {
+                std::snprintf(gate_suffix, sizeof(gate_suffix), "gate=off");
+            } else if (sequence.budget_cur == 0) {
+                std::snprintf(gate_suffix, sizeof(gate_suffix), "gate=inert(upper=%u)", gate_upper);
+            } else {
+                char margin_text[40];
+                if (sequence.ring_margin.valid) {
+                    std::snprintf(margin_text, sizeof(margin_text), "%.4f",
+                                  static_cast<double>(sequence.ring_margin.ratio));
+                } else {
+                    std::snprintf(margin_text, sizeof(margin_text), "n/a");
+                }
+                std::snprintf(gate_suffix, sizeof(gate_suffix),
+                              "gate=%s cur=%u upper=%u margin=%s cooldown=%u",
+                              gate_grew ? "grow" : "hold", sequence.budget_cur, gate_upper, margin_text,
+                              sequence.cooldown_left);
+            }
             std::fprintf(stderr,
                          "[ring] budgets: skeleton=%u, evidence=%u, recent=%u, free=%u (pool %u) "
-                         "[skeleton+evidence+recent+free == pool: %s]\n",
+                         "[skeleton+evidence+recent+free == pool: %s] %s\n",
                          b_skeleton, b_evidence, b_recent, b_free, pool,
-                         (b_skeleton + b_evidence + b_recent + b_free) == pool ? "yes" : "NO");
+                         (b_skeleton + b_evidence + b_recent + b_free) == pool ? "yes" : "NO",
+                         gate_suffix);
         }
-        const std::uint32_t mapped_now = text_kv_addresses->mapped_pages(sequence.kv->text);
         if (budget != 0 && mapped_now > sink_pages &&
             (mapped_now != sequence.ring_scored_mapped || sequence.ring_keep.empty())) {
-            preferred = select_retrieval_pages(sequence, sink_pages, mapped_now, budget);
+            preferred = select_retrieval_pages(sequence, sink_pages, mapped_now, budget, &sequence.ring_margin);
             sequence.ring_keep          = preferred;
             sequence.ring_scored_mapped = mapped_now;
         } else if (mapped_now == sequence.ring_scored_mapped) {
@@ -2517,6 +2728,16 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
             preferred.clear();
             sequence.ring_keep.clear();
             sequence.ring_scored_mapped = mapped_now;
+            // LOCAL (G7/G4 gate, 2026-10-15): a recycled lane must not inherit the previous request's
+            // grown budget. This branch is the request's OPENING phase (it is the one taken while
+            // mapped_now <= sink_pages, before the first reselection can happen), so clearing here gives
+            // the controller per-request state: it re-seeds from the configured budget and re-measures
+            // its own margin, instead of starting a fresh request already tuned for an unrelated one.
+            // The measured margin goes too, so the first reselection of the new request cannot act on a
+            // stale reading (`margin=n/a` in the row above is the visible consequence).
+            sequence.budget_cur    = 0;
+            sequence.cooldown_left = 0;
+            sequence.ring_margin   = RingBudgetMargin{};
         }
         // The hysteresis set may reference pages beyond the current mapping (stale lane reuse);
         // clamp it so logical_page() below can never throw.

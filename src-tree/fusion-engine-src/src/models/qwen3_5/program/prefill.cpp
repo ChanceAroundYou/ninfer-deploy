@@ -736,6 +736,27 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         request.publish_continuation = request_plan.summary.publish_continuation;
         sequence.mtp_draft_count     = 0;
         sequence.tail_hidden_valid   = base == prompt_tokens && sequence.tail_hidden_valid;
+        // LOCAL (G3 action-region query span, 2026-10-15): capture the LEDGER-TAIL fallback for the
+        // action region BEFORE the swap below overwrites the ledger with this prompt's own tokens.
+        // The order is the whole point: after the swap the ledger IS the new prompt, so its tail is the
+        // new QUESTION -- and truncating a question is precisely the substitution the paper's §5.1 warns
+        // against ("当前 last-user span 是观测不是动作"). Before the swap the ledger is the history this
+        // request inherited; for a cached-prefix continuation that history ends with the previous turn's
+        // generated output, which is the action region. Consumed by the per-chunk publish in
+        // advance_prefill, and only when the prompt carries no assistant message of its own.
+        {
+            const std::int32_t action_maxq = ops::detail::kvmem_score_env_i32(
+                "NINFER_TERNARY_KVMEM_SCORE_MAXQ", 256);
+            const std::int32_t action_tail_n = ops::detail::kvmem_action_tail_n(action_maxq);
+            const std::int32_t have          = static_cast<std::int32_t>(sequence.ledger.size());
+            if (action_tail_n > 0 && have > 0) {
+                request.action_fallback_begin = have > action_tail_n ? have - action_tail_n : 0;
+                request.action_fallback_end   = have;
+            } else {
+                request.action_fallback_begin = -1;
+                request.action_fallback_end   = -1;
+            }
+        }
         sequence.ledger.swap(materialization_ledger_);
         sequence.prefix_identity.swap(materialization_identity_);
         sequence.prefix_digests.swap(materialization_prefix_digests_);
@@ -1243,6 +1264,44 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 // so one sequence's chunk could be scored against another sequence's question.
                 ops::detail::kvmem_score_set_query_span(sequence.lane, staged.prompt.query_span_begin,
                                                         staged.prompt.query_span_end);
+                // LOCAL (G3 action-region query span, 2026-10-15): publish THIS chunk's action region,
+                // under the same per-chunk discipline as the query span above -- a stale span left over
+                // from another request would score the wrong tokens, and a stale ACTION query is the
+                // silent-wrong-answer class (it answers this turn's question out of what the previous
+                // one needed).
+                // Priority is exact > fallback, and the tail window is applied HERE rather than in the
+                // scorer: the span's whole meaning is "the TAIL of the previous output" (that is the part
+                // closest to the next action), so the tail must be taken before the chunk intersection --
+                // taking it afterwards would let the chunk intersect away the very part we want.
+                //   * exact    = the prompt's last assistant message (frontend, token space);
+                //   * fallback = the ledger tail captured in start_sequence before the materialization
+                //                swap (see the comment there for why the order matters).
+                // `action_src=` on the SELECT line reports which of the two won, per the audit rule.
+                {
+                    const std::int32_t action_maxq = ops::detail::kvmem_score_env_i32(
+                        "NINFER_TERNARY_KVMEM_SCORE_MAXQ", 256);
+                    const std::int32_t action_tail_n = ops::detail::kvmem_action_tail_n(action_maxq);
+                    std::int32_t action_begin  = -1;
+                    std::int32_t action_end    = -1;
+                    const char*  action_source = "none";
+                    if (action_tail_n > 0) {
+                        if (staged.prompt.action_span_begin >= 0 &&
+                            staged.prompt.action_span_end > staged.prompt.action_span_begin) {
+                            action_end   = staged.prompt.action_span_end;
+                            action_begin = action_end - action_tail_n;
+                            if (action_begin < staged.prompt.action_span_begin) {
+                                action_begin = staged.prompt.action_span_begin;
+                            }
+                            action_source = "prompt_assistant";
+                        } else if (request.action_fallback_end > request.action_fallback_begin) {
+                            action_begin  = request.action_fallback_begin;
+                            action_end    = request.action_fallback_end;
+                            action_source = "ledger_tail";
+                        }
+                    }
+                    ops::detail::kvmem_score_set_action_span(sequence.lane, action_begin, action_end,
+                                                             action_source);
+                }
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
@@ -1492,24 +1551,3 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
 
 } // namespace ninfer::models::qwen3_5::detail
-
-namespace ninfer::models::qwen3_5 {
-
-// LOCAL (KVMem query span, D-12, 2026-10-02): the definition behind the declaration in
-// frontend/prepared_prompt.h. It lives here because this TU already includes ops/kvmem/kvmem_score.h
-// (the frontend must not grow a CUDA/ops include just to reach the scorer).
-void kvmem_publish_query_span(std::int32_t begin, std::int32_t end) noexcept {
-    // B06: BROADCAST. The frontend runs in the request path, before any lane exists -- a lane is only
-    // assigned at commit time (commit.cpp:119) -- so it cannot publish to one lane. The span belongs
-    // to the REQUEST, and every lane that prefills this request has to see it. Two concurrent
-    // requests can still race here exactly as they raced on the old single global slot; the
-    // difference is that the driver republishes the correct per-lane span before each chunk
-    // (prefill.cpp:1206) for every path that runs chunks. The broadcast is what covers the shapes
-    // that run none -- the forced-token suffix prefill in transactions/commit.cpp, which bypasses
-    // the driver loop entirely (measured stale-span failure, 2026-10-02).
-    for (std::uint32_t lane = 0; lane < ninfer::kMaximumConcurrency; ++lane) {
-        ops::detail::kvmem_score_set_query_span(lane, begin, end);
-    }
-}
-
-} // namespace ninfer::models::qwen3_5

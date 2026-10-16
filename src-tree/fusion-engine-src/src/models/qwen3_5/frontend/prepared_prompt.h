@@ -20,15 +20,6 @@ namespace frontend {
 struct ToolCallOutputContract;
 }
 
-// LOCAL (KVMem query span, D-12, 2026-10-02): publish this request's absolute query span (the last user
-// turn, in TOKEN indices of the complete rendered prompt) to the KVMem scorer. Declared HERE and
-// defined in the model runtime (program/prefill.cpp) on purpose: the frontend must not grow a CUDA/ops
-// include just to reach the scorer, and the publish has to happen in the REQUEST path -- publishing
-// only from the prefill driver missed the suffix-only prefill of a cached-prefix turn 2, which then
-// silently ran on a STALE span (measured 2026-10-02; see the fallback comment in kvmem_score.h).
-// -1/-1 = unknown -> the scorer keeps its tail rule.
-void kvmem_publish_query_span(std::int32_t begin, std::int32_t end) noexcept;
-
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
 // Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple
@@ -186,6 +177,18 @@ struct PreparedPromptData {
     // holding the old layout reads the wrong offsets (the stale-obj startup death of 2026-10-02).
     std::int32_t query_span_begin = -1;
     std::int32_t query_span_end   = -1;
+    // LOCAL (G3 action-region query span, 2026-10-15): the LAST ASSISTANT MESSAGE of this prompt, in the
+    // same absolute token indices as query_span_* above. It is the ACTION region of the paper's §5.1
+    // ("动作区 query"): the previous turn's output, which is where a tool call / action actually lives --
+    // as opposed to the last user turn, which is an observation of the question. The consumer
+    // (program/prefill.cpp -> ops/kvmem/kvmem_score.h) takes this span's TAIL (_ACTION_TAIL_N, clamped
+    // to MAXQ) and gives it priority over the query span. -1 = no assistant message in this prompt ->
+    // the consumer falls back to the sequence's ledger tail (the previous turn's own output when this
+    // prompt is a cached-prefix continuation), then to the tail rule.
+    // APPENDED AT THE END ON PURPOSE, same reason as query_span_*: a mid-struct insert shifts every
+    // later member and any TU still holding the old layout reads the wrong offsets.
+    std::int32_t action_span_begin = -1;
+    std::int32_t action_span_end   = -1;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 

@@ -388,7 +388,14 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 if (is_masked_draft_backend(speculative_backend)) {
                     mark_workspace_usage(workspace_plan.dflash_context);
                 }
-                const execution::PrefillChunkResult result = execution::prefill_text_chunk(
+                // Forced-token rows do not carry a prepared user/action span. Publish the neutral
+            // values on the worker's lane before every suffix chunk so a prior request's span
+            // cannot leak through the score probe.
+            ops::detail::kvmem_score_set_query_span(sequence.lane, -1, -1);
+            ops::detail::kvmem_score_set_action_span(sequence.lane, -1, -1, "none");
+            ops::detail::kvmem_score_set_chunk_origin(sequence.lane,
+                                                       static_cast<std::int32_t>(cursor));
+            const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                     schedule_state, sequence.ledger, count, std::nullopt, false);
                 if (result.finalized || result.processed_tokens == 0 ||
                     result.processed_tokens > count) {
