@@ -3,6 +3,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "runtime/engine/scoped_release_stats.h"
 #include "ops/kvmem/kvmem_lrfu.h"
+#include "ops/kvmem/kvmem_page_selection.h"
 
 namespace ninfer::ops::detail { struct KvMemScoreProbe; }
 
@@ -459,10 +460,10 @@ struct DecodeGraphFamily {
 // `valid == false` means there IS no boundary to be thin (nothing was dropped because the budget covers
 // the whole range, or nothing was kept at all). That is deliberately NOT a growth signal -- with no
 // boundary the budget is not constraining anything, so raising it cannot recover a lost page.
-struct RingBudgetMargin {
-    float ratio = 0.0F;
-    bool  valid = false;
-};
+// The measurement itself lives in ops/kvmem/kvmem_page_selection.h (2026-10-16) with the seam
+// completion it is paired with, so both can be qualified without constructing a Program. This name is
+// the ring's reading of it; the fields and their meaning are the Op's.
+using RingBudgetMargin = ops::detail::KvMemBudgetMargin;
 
 struct SequenceState {
     ops::detail::KvMemLrfuRound lrfu;

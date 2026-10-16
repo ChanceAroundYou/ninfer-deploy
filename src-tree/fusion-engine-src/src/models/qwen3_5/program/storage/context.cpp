@@ -3,6 +3,7 @@
 #include "core/device.h"
 // LOCAL (KVMem content scoring, 2026-10-02): the scorer's published selection + scores. Header-only,
 // host-safe (it pulls cuda_runtime, not a CUDA kernel header), so no build wiring is needed.
+#include "ops/kvmem/kvmem_page_selection.h"
 #include "ops/kvmem/kvmem_score.h"
 
 #include <algorithm>
@@ -1652,50 +1653,9 @@ ProgramImpl::restore_kv_pages_from_host(KVAddressSpaceStore& addresses, LogicalK
     return resident;
 }
 
-// LOCAL FIX (D-5 seam completeness, 2026-10-04): visibility is PAGE granularity, so evidence that
-// straddles a page boundary is cut in half -- and the measured failure mode at a small pool is exactly
-// that: the model answers with a TRUNCATED needle (`ZX-7001` -> `ZX-700`, `ARCH-4201` -> `ARCH-420`,
-// 4/4 deterministic in the ledger's D-5 note; the pool-4000 multi-needle arm loses turn 2 on 4 of 6
-// trials precisely because the needle's own page was brought back without its neighbour).
-//
-// That is what "a small window cannot hold a big question" looks like once it is measured: it is not
-// that 63 pages cannot hold one needle -- it is that the resident set holds HALF of it. The cure does
-// not need a bigger pool, it needs complete evidence for the pages the scorer picked.
-//
-// Policy: walk the ranked pages best-first and complete each one's neighbourhood while the budget
-// lasts. Breadth is traded for completeness on purpose: 31 isolated pages become ~10 fully covered
-// ones, and a needle needs 3 of them at most (its page plus the two the seam can be on). The budget
-// stays the hard cap, so this never asks the ring to hold more than it already did.
-std::vector<std::uint32_t> add_seam_neighbors(std::vector<std::uint32_t> ranked,
-                                              std::uint32_t begin, std::uint32_t end,
-                                              std::uint32_t budget, std::uint32_t reach) {
-    std::vector<std::uint32_t> out;
-    if (reach == 0 || budget == 0 || ranked.empty()) { return ranked; }
-    out.reserve(ranked.size() + 2U * reach * ranked.size());
-    const auto contains = [](const std::vector<std::uint32_t>& pages, std::uint32_t page) {
-        return std::find(pages.begin(), pages.end(), page) != pages.end();
-    };
-    for (const std::uint32_t page : ranked) {
-        if (page < begin || page >= end) { continue; }
-        if (!contains(out, page)) { out.push_back(page); }
-        for (std::uint32_t step = 1; step <= reach; ++step) {
-            // FORWARD first: the measured symptom is a truncated TAIL ("...->  ZX-700"), and what is
-            // missing sits in the page that follows. Backward is added next, for a needle whose
-            // beginning was the part that fell on the far side of the seam.
-            const std::uint32_t forward = page + step;
-            if (forward < end && !contains(out, forward)) { out.push_back(forward); }
-            if (out.size() >= budget) { break; }
-            const std::uint32_t backward = page >= step ? page - step : 0U;
-            if (page >= step && backward >= begin && !contains(out, backward)) {
-                out.push_back(backward);
-            }
-            if (out.size() >= budget) { break; }
-        }
-        if (out.size() >= budget) { break; }
-    }
-    if (out.size() > budget) { out.resize(budget); }
-    return out;
-}
+// D-5 seam completion moved to ops/kvmem/kvmem_page_selection.h (2026-10-16): it is a closed
+// transformation of a page set, it owns no sequence state, and living here -- behind a TU that pulls
+// the whole engine -- is why it had no test. The policy note moved with it.
 
 // How many pages on EITHER side of a selected page are brought back with it.
 //   0 = the shipped behaviour, i.e. this fix's NEGATIVE CONTROL (`NINFER_KV_NEIGHBOR_PAGES=0`)
@@ -1711,53 +1671,10 @@ std::uint32_t proto_kv_neighbor_pages() {
     return reach;
 }
 
-namespace {
-// LOCAL (G7/G4 ring adaptive budget, 2026-10-15): measure how thin the budget's boundary is.
-// `ranked` must be sorted by DESCENDING score and `budget` is how many entries the caller is about to
-// keep. See RingBudgetMargin (program_impl.h) for what the ratio means and why it is normalised.
-// ALWAYS WRITES, and clears `valid` when there is no boundary to measure -- either nothing was kept, or
-// nothing was dropped because the budget covers the whole range. The clearing is the point: in both of
-// those cases the budget line decided nothing, so there is NO margin to read. Keeping a previous
-// reselection's reading there instead would let a razor-thin margin from an earlier chunk authorise
-// growth on prompts where the budget is not binding at all -- the gate would climb on no evidence.
-void ring_measure_margin(
-    const std::vector<std::pair<float, std::uint32_t>>& ranked, std::uint32_t budget,
-    RingBudgetMargin* margin_out) {
-    if (margin_out == nullptr) { return; }
-    const std::size_t cut = std::min<std::size_t>(budget, ranked.size());
-    if (cut == 0 || cut >= ranked.size()) {
-        margin_out->ratio = 0.0F;
-        margin_out->valid = false;
-        return;
-    }
-    const float gap     = ranked[cut - 1].first - ranked[cut].first;   // >= 0: sorted descending
-    const float steps   = static_cast<float>(cut > 1 ? cut - 1 : 1);
-    const float typical = (ranked.front().first - ranked[cut - 1].first) / steps;
-    const float floor_step = 1e-12F;   // guards the division only; it is not a tuned threshold
-    margin_out->ratio = gap / (typical > floor_step ? typical : floor_step);
-    margin_out->valid = true;
-}
-
-// The lexical fallback path scores in double (IDF sums), so it needs its own instantiation rather than a
-// conversion copy -- the fallback is the negative control's own path and must stay untouched numerically.
-void ring_measure_margin(
-    const std::vector<std::pair<double, std::uint32_t>>& ranked, std::uint32_t budget,
-    RingBudgetMargin* margin_out) {
-    if (margin_out == nullptr) { return; }
-    const std::size_t cut = std::min<std::size_t>(budget, ranked.size());
-    if (cut == 0 || cut >= ranked.size()) {
-        margin_out->ratio = 0.0F;
-        margin_out->valid = false;
-        return;
-    }
-    const double gap     = ranked[cut - 1].first - ranked[cut].first;
-    const double steps   = static_cast<double>(cut > 1 ? cut - 1 : 1);
-    const double typical = (ranked.front().first - ranked[cut - 1].first) / steps;
-    const double floor_step = 1e-12;
-    margin_out->ratio = static_cast<float>(gap / (typical > floor_step ? typical : floor_step));
-    margin_out->valid = true;
-}
-} // namespace
+// G7/G4 ring adaptive budget: how thin the budget's boundary is. Moved to
+// ops/kvmem/kvmem_page_selection.h (2026-10-16) with add_seam_neighbors, for the same reason -- the
+// float overload is the content scorer's path and the double one is the lexical fallback's, and the
+// two are the negative control for each other, so they need a test more than they need to be file-local.
 
 // LOCAL PROTOTYPE (KVMem-style ring retrieval): rank the pages that are (or are about to become)
 // Host-resident by lexical overlap with the recent context, and return the top `budget` page
@@ -1829,7 +1746,7 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
                     return left.first != right.first ? left.first > right.first
                                                      : left.second < right.second;
                 });
-                ring_measure_margin(ranked, budget, margin_out);
+                ops::detail::kvmem_measure_budget_margin(ranked, budget, margin_out);
                 if (ranked.size() > budget) { ranked.resize(budget); }
                 // D-5: complete the evidence of the pages we keep, in score order, while the budget
                 // lasts. The result is re-sorted below because callers binary-search it
@@ -1837,8 +1754,8 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
                 std::vector<std::uint32_t> by_score;
                 by_score.reserve(ranked.size());
                 for (const auto& entry : ranked) { by_score.push_back(entry.second); }
-                selected = add_seam_neighbors(std::move(by_score), begin, end, budget,
-                                              proto_kv_neighbor_pages());
+                selected = ops::detail::add_seam_neighbors(std::move(by_score), begin, end, budget,
+                                                           proto_kv_neighbor_pages());
                 if (selected.empty()) {
                     selected.reserve(ranked.size());
                     for (const auto& entry : ranked) { selected.push_back(entry.second); }
@@ -1894,7 +1811,7 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
     std::sort(scored.begin(), scored.end(), [](const auto& left, const auto& right) {
         return left.first != right.first ? left.first > right.first : left.second < right.second;
     });
-    ring_measure_margin(scored, budget, margin_out);
+    ops::detail::kvmem_measure_budget_margin(scored, budget, margin_out);
     if (scored.size() > budget) { scored.resize(budget); }
     selected.reserve(scored.size());
     for (const auto& entry : scored) { selected.push_back(entry.second); }

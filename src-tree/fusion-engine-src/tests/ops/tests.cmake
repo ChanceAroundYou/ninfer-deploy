@@ -1,12 +1,18 @@
 ninfer_add_test(ninfer_kvmem_lrfu_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_kvmem_lrfu.cpp")
 
+# Seam completion and budget-margin measurement. Pure host arithmetic with no device work, so it runs
+# everywhere the test suite does; op_oracle_options because the margin assertions compare computed
+# floats exactly.
+ninfer_add_op_test(ninfer_kvmem_page_selection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_kvmem_page_selection.cpp")
 
 # Who owns the score probe. Needs the CUDA headers kvmem_score.h pulls in (via ninfer_ops), but
 # launches nothing, so it runs wherever the suite does.
 ninfer_add_test(ninfer_kvmem_score_binding_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_kvmem_score_binding.cpp"
   LIBRARIES ninfer_ops)
+
 set(ninfer_op_tests
   add_bias
   gelu
