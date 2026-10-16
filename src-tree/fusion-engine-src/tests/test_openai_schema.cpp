@@ -71,6 +71,40 @@ Json parse_sse(const std::string& event) {
     return Json::parse(event.substr(prefix.size(), event.size() - prefix.size() - 2));
 }
 
+int test_explicit_retrieval_continuation() {
+    int failures = 0;
+    failures += check(!parse(base_request()).cache_hints.continue_retrieval_history,
+                      "retrieval history inheritance defaults off");
+    Json body = base_request();
+    body["context_cache"] = Json{{"session_key", "fixture-session"},
+                                 {"continue_retrieval_history", true}};
+    const auto request = parse(body);
+    failures += check(request.cache_hints.session_key == "fixture-session" &&
+                          request.cache_hints.continue_retrieval_history,
+                      "explicit session and retrieval continuation opt-in parsed");
+    body["context_cache"] = Json{{"session_key", "fixture-session"}};
+    failures += check(!parse(body).cache_hints.continue_retrieval_history,
+                      "explicit session alone does not trust retrieval history");
+    for (const Json& invalid : std::vector<Json>{
+             nullptr, true, Json::array(), Json{{"continue_retrieval_history", true}},
+             Json{{"session_key", ""}, {"continue_retrieval_history", true}},
+             Json{{"session_key", 1}},
+             Json{{"session_key", std::string(ninfer::kMaximumContextCacheSessionKeyBytes + 1, 'x')}},
+             Json{{"session_key", "s"}, {"continue_retrieval_history", "true"}},
+             Json{{"session_key", "s"}, {"continue_retrieval_history", nullptr}},
+             Json{{"session_key", "s"}, {"unknown", true}}}) {
+        body["context_cache"] = invalid;
+        failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                          "malformed experimental context cache rejected");
+    }
+    body["context_cache"] = Json{{"continue_retrieval_history", true}};
+    body["prompt_cache_key"] = "advisory-only";
+    body["previous_response_id"] = "not-evidence";
+    failures += check(api_error([&] { (void)parse(body); }).status == 400,
+                      "advisory and response keys cannot replace explicit session key");
+    return failures;
+}
+
 int test_request_envelope_and_sampling() {
     int failures                  = 0;
     Json body                     = base_request();
@@ -1250,6 +1284,7 @@ int test_assistant_continuation_mode() {
 
 int main() {
     int failures = 0;
+    failures += test_explicit_retrieval_continuation();
     failures += test_request_envelope_and_sampling();
     failures += test_structured_output();
     failures += test_standard_field_policy();

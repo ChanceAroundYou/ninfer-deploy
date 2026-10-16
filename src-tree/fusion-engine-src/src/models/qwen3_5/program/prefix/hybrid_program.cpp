@@ -14,6 +14,7 @@
 #include "core/device.h"
 #include "core/startup.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "ops/kvmem/kvmem_score.h"
 
 #include <algorithm>
 #include <array>
@@ -754,6 +755,13 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         continuation_bound         = true;
         SequenceState& sequence    = continuation_states[*continuation];
         sequence.lane              = lane;
+        if (ops::detail::kvmem_lrfu_enabled()) {
+            // Hybrid snapshots match content, not a private continuation capability.
+            sequence.kvmem_score_workspace = std::make_shared<ops::detail::KvMemScoreProbe>();
+            ops::detail::kvmem_lrfu_round_begin(sequence.lrfu, lane_epochs[lane], {});
+            ops::detail::kvmem_score_bind(lane, sequence.kvmem_score_workspace, &sequence.lrfu);
+            std::fprintf(stderr, "[lrfu] begin lane=%u source=neutral-hybrid\n", lane);
+        }
 
         // State: a zero image, a Device snapshot copy, or the Host restore already landed in the
         // destination.

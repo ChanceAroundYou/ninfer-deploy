@@ -20,6 +20,7 @@ struct GenerationOutcome;
 struct OpenAIChatRequest {
     std::string model;
     GenerationRequest generation;
+    ContextCacheHints cache_hints;
     bool stream                 = false;
     bool include_usage          = false;
     bool output_tokens_explicit = false;

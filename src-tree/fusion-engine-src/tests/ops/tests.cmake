@@ -1,3 +1,6 @@
+ninfer_add_test(ninfer_kvmem_lrfu_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_kvmem_lrfu.cpp")
+
 set(ninfer_op_tests
   add_bias
   gelu

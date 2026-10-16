@@ -1017,6 +1017,39 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
     }
 }
 
+void parse_experimental_context_cache(const Json& body, ContextCacheHints& hints) {
+    if (!body.contains("context_cache")) { return; }
+    const Json& cache = body.at("context_cache");
+    if (!cache.is_object()) {
+        bad_request("context_cache must be an object", "context_cache");
+    }
+    for (auto it = cache.begin(); it != cache.end(); ++it) {
+        if (it.key() != "session_key" && it.key() != "continue_retrieval_history") {
+            bad_request("unknown context_cache field", "context_cache." + it.key());
+        }
+    }
+    if (cache.contains("session_key")) {
+        const Json& key = cache.at("session_key");
+        if (!key.is_string() || key.get_ref<const std::string&>().empty() ||
+            key.get_ref<const std::string&>().size() > kMaximumContextCacheSessionKeyBytes) {
+            bad_request("session_key must be a non-empty string within the session key byte limit",
+                        "context_cache.session_key");
+        }
+        hints.session_key = key.get<std::string>();
+    }
+    if (cache.contains("continue_retrieval_history")) {
+        if (!cache.at("continue_retrieval_history").is_boolean()) {
+            bad_request("continue_retrieval_history must be a boolean",
+                        "context_cache.continue_retrieval_history");
+        }
+        hints.continue_retrieval_history = cache.at("continue_retrieval_history").get<bool>();
+    }
+    if (hints.continue_retrieval_history && !hints.session_key) {
+        bad_request("retrieval continuation requires an explicit context_cache.session_key",
+                    "context_cache.session_key");
+    }
+}
+
 } // namespace
 
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
@@ -1026,6 +1059,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
+    parse_experimental_context_cache(body, output.cache_hints);
     if (body.contains("response_format") && !body.at("response_format").is_null()) {
         output.generation.structured_output =
             parse_structured_output(body.at("response_format"), true, "response_format");

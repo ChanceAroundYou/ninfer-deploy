@@ -633,9 +633,11 @@ ProgramImpl::release_checkpoint_reference(StateImageHandle checkpoint) noexcept 
 }
 
 detail::PhysicalResources
-ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup& group,
-                                     StateImageHandle checkpoint,
-                                     std::optional<runtime::CheckpointRef> replacement) {
+ProgramImpl::install_private_capture(
+    SequenceState& sequence, const CaptureGroup& group, StateImageHandle checkpoint,
+    std::optional<runtime::CheckpointRef> replacement,
+    std::shared_ptr<const ops::detail::KvMemLrfuHistory> lrfu_history,
+    std::optional<std::uint64_t> lrfu_pending_token) {
     detail::PhysicalResources removed;
     if (group.rewrite) {
         if (sequence.rewrite_state && *sequence.rewrite_state != checkpoint) {
@@ -645,6 +647,8 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
         state_store->retain_checkpoint_reference(checkpoint);
         sequence.rewrite_state      = checkpoint;
         sequence.rewrite_checkpoint = RewriteCheckpoint{
+            .lrfu_history = lrfu_history,
+            .lrfu_pending_token = lrfu_pending_token,
             .valid        = true,
             .kind         = *group.rewrite,
             .frontier     = group.frontier,
@@ -690,6 +694,8 @@ ProgramImpl::install_private_capture(SequenceState& sequence, const CaptureGroup
         }
         state_store->retain_checkpoint_reference(checkpoint);
         sequence.long_anchors.push_back(LongAnchorCheckpoint{
+            .lrfu_history = lrfu_history,
+            .lrfu_pending_token = lrfu_pending_token,
             .state        = checkpoint,
             .frontier     = group.frontier,
             .ordinal      = ordinal,
@@ -855,6 +861,9 @@ bool ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         }
     }
 
+    transaction.lrfu_history = sequence.lrfu.history;
+    transaction.lrfu_pending_token =
+        sequence.lrfu.active ? std::optional<std::uint64_t>(sequence.lrfu.token) : std::nullopt;
     state_store->freeze(transaction.source_state);
     if (transaction.state_placement == qwen3_5::CaptureStatePlacement::DeviceFork) {
         (void)state_store->begin_fork(transaction.source_state, transaction.destination_state);
@@ -1078,7 +1087,9 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
         }
         removed = checked_resource_sum(
             removed, install_private_capture(sequence, transaction.group, transaction.source_state,
-                                             transaction.private_replacement));
+                                             transaction.private_replacement,
+                                             transaction.lrfu_history,
+                                             transaction.lrfu_pending_token));
     }
     if (transaction.replaces_shared) {
         if (!transaction.shared_index) {

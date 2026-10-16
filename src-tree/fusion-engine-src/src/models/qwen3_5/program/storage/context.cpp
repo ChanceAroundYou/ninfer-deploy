@@ -249,6 +249,11 @@ void ProgramImpl::release_continuation_slot_best_effort(std::uint32_t index) noe
 void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     if (index >= continuation_capacity) { std::terminate(); }
     SequenceState& sequence     = continuation_states[index];
+    if (sequence.kvmem_score_workspace) {
+        ops::detail::kvmem_score_unbind(sequence.lane, sequence.kvmem_score_workspace);
+        sequence.kvmem_score_workspace.reset();
+    }
+    sequence.lrfu = {};
     sequence.execution_frontier = 0;
     sequence.ledger_frontier    = 0;
     sequence.ledger.clear();
@@ -1734,10 +1739,12 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
         // B06: read THIS sequence's probe. The probe is per-lane because it is written by this
         // sequence's own prefill round and read back here for the same sequence; a process-global
         // probe let a concurrent prefill on another lane overwrite the ranking between the two.
-        const std::vector<std::int32_t>& kept =
-            ops::detail::kvmem_score_selected_blocks(sequence.lane);
-        const std::vector<float>& scores = ops::detail::kvmem_score_host_scores(sequence.lane);
-        const std::int32_t scored = ops::detail::kvmem_score_scored_blocks(sequence.lane);
+        const bool owned = ops::detail::kvmem_lrfu_enabled() && sequence.kvmem_score_workspace;
+        const auto& probe = owned ? *sequence.kvmem_score_workspace
+                                  : ops::detail::kvmem_score_probe(sequence.lane);
+        const std::vector<std::int32_t>& kept = probe.kept;
+        const std::vector<float>& scores = probe.score_host;
+        const std::int32_t scored = probe.scored_n_blocks;
         if (!kept.empty() && scored > 0 && !scores.empty()) {
             std::vector<std::pair<float, std::uint32_t>> ranked;
             ranked.reserve(kept.size());
@@ -1752,7 +1759,8 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
                 if (page < begin || page >= end) { continue; }
                 if (static_cast<std::size_t>(block) >= scores.size()) { continue; }
                 ranked.emplace_back(
-                    lrfu_on ? ops::detail::kvmem_score_lrfu_score(sequence.lane, block)
+                    lrfu_on ? ops::detail::kvmem_lrfu_score(sequence.lrfu.preview,
+                                                          static_cast<std::size_t>(block))
                             : scores[static_cast<std::size_t>(block)],
                     page);
             }

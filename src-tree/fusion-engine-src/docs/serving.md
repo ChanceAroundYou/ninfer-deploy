@@ -479,6 +479,22 @@ The endpoint supports:
   `chat_template_kwargs`;
 - Assistant `reasoning_content` and `reasoning` history aliases.
 
+### Experimental retrieval-history continuation
+
+For isolated LRFU fixtures, Chat Completions accepts a top-level extension:
+`"context_cache": {"session_key": "fixture-session", "continue_retrieval_history": true}`.
+`session_key` must be a non-empty string within the Engine session-key byte limit;
+`continue_retrieval_history` must be a boolean and defaults to `false`. Setting it to `true`
+requires the explicit `context_cache.session_key` in the same request. Malformed values and unknown
+fields inside `context_cache` return HTTP 400. A session key alone never opts in.
+
+This is permission to inherit LRFU retrieval history only if the chosen private checkpoint is the
+currently bound entry for that exact session (owner and revision must match). It does not force
+cache reuse: root execution, shared prefixes, content-only matches, and stale or different session
+bindings do not inherit history. Automatic derived session keys, advisory `prompt_cache_key`, and
+`previous_response_id` never grant this permission. This extension does not change Responses or
+Anthropic request schemas.
+
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes JSON constrained output, nonzero `logit_bias`, requested log probabilities,
 audio/file input or audio output, `required` tool choice over several callable tools, explicit

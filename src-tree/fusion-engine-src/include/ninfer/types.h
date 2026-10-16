@@ -822,6 +822,9 @@ struct PromptCacheMarker {
 
 struct ContextCacheHints {
     std::optional<std::string> session_key;
+    // Explicitly inherit retrieval history only from the currently bound named session.
+    // Content matches, derived keys and shared prefixes are not continuation evidence.
+    bool continue_retrieval_history = false;
     CacheRetentionHint retention = CacheRetentionHint::Default;
     std::vector<PromptCacheMarker> markers;
     // Structural shared candidates the Engine derives from the prompt's own shape: after the

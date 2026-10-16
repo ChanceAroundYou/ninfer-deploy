@@ -431,9 +431,16 @@ public:
                         entry.session && (!base.context_cache().session_key ||
                                           *entry.session != *base.context_cache().session_key ||
                                           !base.context_cache().update_session_index);
+                    const bool current_session_binding =
+                        current_session_cell &&
+                        session_index_[*current_session_cell].slot == index.slot &&
+                        session_index_[*current_session_cell].owner_id == entry.id &&
+                        session_index_[*current_session_cell].revision == entry.revision;
                     std::optional<AdmissionCandidate> plan =
-                        program.inspect_admission(prompt, base, *destination, &*entry.handle,
-                                                  nullptr, index.checkpoint, retain);
+                        program.inspect_admission(
+                            prompt, base, *destination, &*entry.handle, nullptr, index.checkpoint,
+                            retain, current_session_binding &&
+                                        base.context_cache().continue_retrieval_history);
                     if (!plan) {
                         cdbg_log("[candgen] priv SKIP slot=%u inspect_admission=nullopt\n",
                                  index.slot);
@@ -447,11 +454,6 @@ public:
                          plan->identity_assessment().source_mode != PrivateSourceMode::Retain)) {
                         throw std::logic_error("Program returned an invalid private candidate");
                     }
-                    const bool current_session_binding =
-                        current_session_cell &&
-                        session_index_[*current_session_cell].slot == index.slot &&
-                        session_index_[*current_session_cell].owner_id == entry.id &&
-                        session_index_[*current_session_cell].revision == entry.revision;
                     append_unique(provisional_demand.exact_resident_keys, index.key);
                     candidates.push_back(Candidate{
                         .plan                    = std::move(*plan),
@@ -2792,8 +2794,22 @@ private:
             return std::nullopt;
         }
 
-        Candidate& candidate =
-            candidates[static_cast<std::size_t>(selected_candidate - candidate_inputs.begin())];
+        const std::size_t selected_index =
+            static_cast<std::size_t>(selected_candidate - candidate_inputs.begin());
+        Candidate& candidate = candidates[selected_index];
+        if (std::getenv("NINFER_MAT_DEBUG") != nullptr) {
+            std::fprintf(stderr,
+                         "[candgen] SELECT cand=%zu private=%d shared=%d current_session=%d "
+                         "source_mode=%d inherit_lrfu=%d\n",
+                         selected_index, candidate.private_source ? 1 : 0,
+                         candidate.shared_source ? 1 : 0,
+                         candidate.current_session_binding ? 1 : 0,
+                         static_cast<int>(planned->source_mode),
+                         candidate.current_session_binding &&
+                                 base.context_cache().continue_retrieval_history
+                             ? 1
+                             : 0);
+        }
 
         Choice choice(destination, std::move(*planned->plan), catalog_count_,
                       base.context_cache().session_key, base.context_cache().retention,

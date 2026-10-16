@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "ops/kvmem/kvmem_score.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
@@ -548,6 +549,23 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
             }
 
             if (pending_kinds[row] != PendingKind::Begin || decisions[row].cancelled) { continue; }
+            auto& sequence = active_sequence(lanes[row]);
+            if (sequence.lrfu.active) {
+                const auto history = ops::detail::kvmem_lrfu_round_accept(sequence.lrfu,
+                                                                          sequence.lrfu.token);
+                std::fprintf(stderr, "[lrfu] accept lane=%u token=%llu round=%llu blocks=%zu\n",
+                             lanes[row], static_cast<unsigned long long>(sequence.lrfu.token),
+                             static_cast<unsigned long long>(history ? history->round : 0),
+                             history ? history->ks.size() : 0);
+                (void)ops::detail::kvmem_lrfu_checkpoint_settle(
+                    sequence.rewrite_checkpoint.lrfu_history,
+                    sequence.rewrite_checkpoint.lrfu_pending_token, sequence.lrfu.token, history);
+                for (auto& anchor : sequence.long_anchors) {
+                    (void)ops::detail::kvmem_lrfu_checkpoint_settle(
+                        anchor.lrfu_history, anchor.lrfu_pending_token, sequence.lrfu.token,
+                        history);
+                }
+            }
             RequestControl& request = requests[lanes[row]];
             if (decisions[row].terminal) {
                 request.prefill.reset();
@@ -795,6 +813,7 @@ AbortResult ProgramImpl::abort(SequenceHandle sequence) noexcept {
         return out;
     }
     SequenceState& state = active_sequence(lane);
+    if (state.lrfu.active) { ops::detail::kvmem_lrfu_round_abort(state.lrfu); }
     const std::uint32_t continuation_index = active_continuations[lane];
     if (hybrid_) {
         // The committed state is publishable as an endpoint when no model unit is in flight.

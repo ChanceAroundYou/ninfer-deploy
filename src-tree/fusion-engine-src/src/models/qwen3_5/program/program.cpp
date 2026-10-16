@@ -314,9 +314,11 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
 std::optional<AdmissionCandidate> Program::inspect_admission(
     const PreparedPrompt& prompt, const RequestBasePlan& base, runtime::LaneId destination,
     const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source) {
+    std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+    bool inherit_retrieval_history) {
     return impl_->inspect_admission(PreparedPromptAccess::view(prompt), base, destination, source,
-                                    shared_source, checkpoint, must_retain_private_source);
+                                    shared_source, checkpoint, must_retain_private_source,
+                                    inherit_retrieval_history);
 }
 
 std::optional<ResourcePlan> Program::seal_identity(const AdmissionCandidate& admission,

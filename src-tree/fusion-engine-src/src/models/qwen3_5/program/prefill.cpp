@@ -237,6 +237,24 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
     const std::uint32_t prompt_tokens      = staged.prompt_tokens;
     const std::uint32_t base               = staged.base;
     const std::uint32_t initial_mtp_extent = staged.initial_mtp_extent;
+    std::shared_ptr<const ops::detail::KvMemLrfuHistory> retrieval_history;
+    if (ops::detail::kvmem_lrfu_enabled() && request_plan.lrfu_lineage_verified &&
+        transaction.has_source && request_plan.selected_checkpoint) {
+        const auto& source = continuation_states[transaction.source_index];
+        if (request_plan.reuse == ReusePath::PrivateEndpoint) {
+            retrieval_history = source.lrfu.history;
+        } else if (is_rewrite_checkpoint_restore(request_plan.reuse)) {
+            retrieval_history = source.rewrite_checkpoint.lrfu_history;
+        } else if (request_plan.reuse == ReusePath::PrivateLongAnchor) {
+            for (const auto& anchor : source.long_anchors) {
+                if (anchor.frontier == request_plan.selected_checkpoint->frontier &&
+                    anchor.ordinal == request_plan.selected_checkpoint->ordinal) {
+                    retrieval_history = anchor.lrfu_history;
+                    break;
+                }
+            }
+        }
+    }
     request.lifecycle                      = Lifecycle::Empty;
     // The sequence's own token ceiling: the last frontier its Device KV lease may cover, so
     // on-demand growth never leases pages the request cannot reach.
@@ -246,6 +264,16 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                                     ? 0U
                                     : request_plan.summary.effective_output_tokens - 1U));
     try {
+        if (ops::detail::kvmem_lrfu_enabled()) {
+            sequence.kvmem_score_workspace = std::make_shared<ops::detail::KvMemScoreProbe>();
+            ops::detail::kvmem_lrfu_round_begin(sequence.lrfu, lane_epochs[lane],
+                                               std::move(retrieval_history));
+            ops::detail::kvmem_score_bind(lane, sequence.kvmem_score_workspace, &sequence.lrfu);
+            std::fprintf(stderr, "[lrfu] begin lane=%u token=%llu base_round=%llu source=%s\n",
+                         lane, static_cast<unsigned long long>(sequence.lrfu.token),
+                         static_cast<unsigned long long>(sequence.lrfu.preview.ks_round),
+                         sequence.lrfu.history ? "private-checkpoint" : "neutral");
+        }
         const std::uint32_t state_slots = request_plan.demand.active_entitlement.device.state_slots;
         const bool preserving_source =
             (transaction.has_source || transaction.has_shared_source) &&
@@ -1136,6 +1164,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.initial_mtp_extent,
             dflash_host_ingress,
             sequence.lane};
+        if (ops::detail::kvmem_lrfu_enabled()) {
+            ops::detail::kvmem_score_bind(sequence.lane, sequence.kvmem_score_workspace,
+                                          &sequence.lrfu);
+        }
         const auto public_tokens =
             static_cast<std::size_t>(dimension(parameters.model.resources().public_token_count));
         if (request.first_token_top_logprobs != 0) {

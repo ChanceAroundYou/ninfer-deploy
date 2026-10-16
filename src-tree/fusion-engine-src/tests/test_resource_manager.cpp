@@ -235,6 +235,7 @@ struct FakeContextCache {
     };
 
     std::optional<FakeCacheSessionKey> session_key;
+    bool continue_retrieval_history = false;
     RetentionClass retention  = RetentionClass::RecentPrivate;
     bool update_session_index = true;
     std::vector<Opportunity> opportunities;
@@ -707,6 +708,7 @@ private:
 class FakeProgram {
 public:
     friend class FakePressurePlanningSession;
+    std::vector<bool> inspected_retrieval_inheritance;
 
     enum class TransactionKind : std::uint8_t {
         None,
@@ -722,7 +724,9 @@ public:
     inspect_admission(const FakePreparedPrompt& prompt, const FakeRequestBasePlan& base, LaneId,
                       const FakeContinuationHandle* source,
                       const FakeSharedPrefixHandle* shared_source,
-                      std::optional<CheckpointRef> checkpoint, bool must_retain_source) {
+                      std::optional<CheckpointRef> checkpoint, bool must_retain_source,
+                      bool inherit_retrieval_history = false) {
+        inspected_retrieval_inheritance.push_back(inherit_retrieval_history);
         ++admission_inspections;
         if (source != nullptr) {
             inspected_private_sources.push_back(source->id);
@@ -2893,6 +2897,35 @@ void test_retained_source_is_protected_until_terminal() {
                                           FakePreparedPrompt{77}, {});
     require(!program.started_action_ids.empty(),
             "released source did not participate in the sealed pressure plan");
+}
+
+void test_retrieval_history_requires_current_session_and_opt_in() {
+    FakeManager manager = make_manager(2, 3);
+    FakeProgram program;
+    const FakeCacheSessionKey session{42};
+    FakeRequestBasePlan base = make_base(42, session, RetentionClass::LiveSession);
+    const ActiveRequest seed = start_active(manager, program, 42, base, 1);
+    (void)finish_active(manager, program, seed, 16);
+    const auto inspect = [&](FakeRequestBasePlan request, std::uint64_t order) {
+        program.inspected_retrieval_inheritance.clear();
+        auto result = manager.inspect(program, FakePreparedPrompt{42}, request, order);
+        require(result.choice.has_value(), "continuation fixture failed to plan");
+        return std::count(program.inspected_retrieval_inheritance.begin(),
+                          program.inspected_retrieval_inheritance.end(), true);
+    };
+    require(inspect(base, 2) == 0, "session key alone inherited retrieval history");
+    base.cache.continue_retrieval_history = true;
+    require(inspect(base, 3) == 1, "current explicit session did not inherit retrieval history");
+    base.cache.session_key = FakeCacheSessionKey{99};
+    require(inspect(base, 4) == 0, "cross-session content hit inherited retrieval history");
+    base.cache.session_key.reset();
+    require(inspect(base, 5) == 0, "anonymous content hit inherited retrieval history");
+    // Replace the named binding with unrelated content; the old matching slot remains anonymous.
+    const ActiveRequest replacement = start_active(
+        manager, program, 99, make_base(99, session, RetentionClass::LiveSession), 6);
+    (void)finish_active(manager, program, replacement, 16);
+    base.cache.session_key = session;
+    require(inspect(base, 7) == 0, "superseded session slot inherited retrieval history");
 }
 
 void test_session_publication_order_controls_tied_source() {
@@ -5152,6 +5185,8 @@ int main() {
     run_test("aborted source is not a hit",
              test_aborted_source_selection_does_not_create_hit_history);
     run_test("retained source protection", test_retained_source_is_protected_until_terminal);
+    run_test("explicit retrieval continuation lineage",
+             test_retrieval_history_requires_current_session_and_opt_in);
     run_test("session publication order", test_session_publication_order_controls_tied_source);
     run_test("canonical pressure", test_canonical_pressure_starts_with_disposable_owner);
     run_test("all preserving pressure alternatives",

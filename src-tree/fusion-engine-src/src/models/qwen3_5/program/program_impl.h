@@ -2,6 +2,9 @@
 #include "models/qwen3_5/program/speculative/mtp_adaptive.h"
 #include "models/qwen3_5/program/internal.h"
 #include "runtime/engine/scoped_release_stats.h"
+#include "ops/kvmem/kvmem_lrfu.h"
+
+namespace ninfer::ops::detail { struct KvMemScoreProbe; }
 
 #include "core/arena.h"
 #include "core/disk_kv_bridge.h"
@@ -265,6 +268,7 @@ struct ResourceCandidateState {
 };
 
 struct AdmissionCandidateImpl : ResourceCandidateState {
+    bool lrfu_lineage_verified = false;
     MtpBridgeMode mtp_bridge = MtpBridgeMode::None;
     bool prepare_mtp         = false;
     std::optional<VisionPrefillPlan> vision;
@@ -396,6 +400,8 @@ struct ContinuationSlot {
 };
 
 struct RewriteCheckpoint {
+    std::shared_ptr<const ops::detail::KvMemLrfuHistory> lrfu_history;
+    std::optional<std::uint64_t> lrfu_pending_token;
     bool valid                 = false;
     RewriteCheckpointKind kind = RewriteCheckpointKind::TurnClosure;
     std::uint32_t frontier     = 0;
@@ -403,6 +409,8 @@ struct RewriteCheckpoint {
 };
 
 struct LongAnchorCheckpoint {
+    std::shared_ptr<const ops::detail::KvMemLrfuHistory> lrfu_history;
+    std::optional<std::uint64_t> lrfu_pending_token;
     StateImageHandle state;
     std::uint32_t frontier = 0;
     std::uint32_t ordinal  = 0;
@@ -439,6 +447,8 @@ struct DecodeGraphFamily {
 // request which produced it has finished, so it is deliberately separate from request lifecycle,
 // output, sampling, and round-control state.
 struct SequenceState {
+    ops::detail::KvMemLrfuRound lrfu;
+    std::shared_ptr<ops::detail::KvMemScoreProbe> kvmem_score_workspace;
     std::optional<SequenceKVBundle> kv;
     ActiveStateBinding state;
     std::optional<StateImageHandle> rewrite_state;
@@ -609,7 +619,8 @@ public:
     [[nodiscard]] std::optional<AdmissionCandidate> inspect_admission(
         const PreparedPromptData& prompt, const RequestBasePlan& base, runtime::LaneId destination,
         const ContinuationHandle* source, const SharedPrefixHandle* shared_source,
-        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source);
+        std::optional<runtime::CheckpointRef> checkpoint, bool must_retain_private_source,
+        bool inherit_retrieval_history = false);
     [[nodiscard]] std::optional<AdmissionCandidate> seal_materialization(
         const AdmissionCandidate& admission, const PreparedPromptData& prompt,
         std::span<const ContinuationHandle* const> pressure_owners,
@@ -1147,6 +1158,8 @@ private:
         std::optional<std::uint32_t> shared_index;
         std::uint64_t replacement_generation = 0;
         StateImageHandle source_state;
+        std::shared_ptr<const ops::detail::KvMemLrfuHistory> lrfu_history;
+        std::optional<std::uint64_t> lrfu_pending_token;
         StateImageHandle destination_state;
         qwen3_5::CaptureStatePlacement state_placement = qwen3_5::CaptureStatePlacement::DeviceFork;
         std::optional<StateImageTransfer> state_snapshot;
@@ -1547,7 +1560,9 @@ private:
     [[nodiscard]] detail::PhysicalResources
     install_private_capture(SequenceState& sequence, const CaptureGroup& group,
                             StateImageHandle checkpoint,
-                            std::optional<runtime::CheckpointRef> replacement);
+                            std::optional<runtime::CheckpointRef> replacement,
+                            std::shared_ptr<const ops::detail::KvMemLrfuHistory> lrfu_history,
+                            std::optional<std::uint64_t> lrfu_pending_token);
     // False when the shared replacement released less than its assessment; the replacement is
     // gone and the capture must be aborted.
     [[nodiscard]] bool prepare_active_capture(ActiveCaptureTransaction& transaction);

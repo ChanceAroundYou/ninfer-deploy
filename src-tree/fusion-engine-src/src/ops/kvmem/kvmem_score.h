@@ -53,6 +53,8 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <memory>
+#include <mutex>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -139,6 +141,13 @@ inline ops::KvMemRetrieveScoreAgg kvmem_score_agg_mode() noexcept {
 
 // ---- 探针状态（进程级单例，与 mean-K 索引同寿命）---------------------------------------------
 struct KvMemScoreProbe {
+    ~KvMemScoreProbe() {
+        if (score != nullptr) { (void)cudaFree(score); }
+        if (block_tokens_dev != nullptr) { (void)cudaFree(block_tokens_dev); }
+    }
+    KvMemScoreProbe() = default;
+    KvMemScoreProbe(const KvMemScoreProbe&) = delete;
+    KvMemScoreProbe& operator=(const KvMemScoreProbe&) = delete;
     // device 缓冲
     float*        score            = nullptr;  // [capacity_blocks]，每 chunk 前清零（打分器只 ADD）
     std::int32_t* block_tokens_dev = nullptr;  // [capacity_blocks]，尾块带真实填充（device 侧）
@@ -184,12 +193,10 @@ struct KvMemScoreProbe {
     bool logged_span_segment = false;   // B05: 长 span 改为切段打分，只喊一次（它是"行为变了"的证据行）
     bool last_agg_max = false;          // 最近一次 finish 的聚合模式（SELECT 行 agg= 审计用）
     // ---- ★ LRFU 跨轮 keep-score（D1，2026-10-15）------------------------------------------------
-    //   ks = committed（上一轮提交的 KS），ks_candidate = preview（本轮候选），ks_round = 已
-    //   提交轮数。score_host 是**当轮**分数（selector 的输入），ks 是**跨轮**累积（重排键）——
-    //   两者绝不复用（P0-3/D1：同轮第二次评分若复用，就会把一次性 cosine 停留在选择信号上）。
-    //   更新只在 finish() 内：先 commit 上轮（若有 candidate），再用本轮 D2H 分数 preview；
-    //   没打分的 chunk 直接丢弃（D3：轮次只在提交时推进）。begin 不碰 ks ⇒ decode 不推进。
-    KvMemLrfuState lrfu;
+    // Program-owned LRFU state is separate from the instantaneous score_host.
+    // finish only accumulates eligible coverage; Program accepts or aborts it.
+    KvMemLrfuRound* lrfu = nullptr;  // non-owning, bound to the active Program sequence
+
 };
 
 // B06: one probe PER LANE. The probe carries the score buffer, the kept block set and the
@@ -202,9 +209,42 @@ struct KvMemScoreProbe {
 // No bounds check here, unlike mean_k_index_for: this accessor is on noexcept paths, and the lane is
 // already provably in range -- startup.cpp:1024 throws unless max_concurrency <= kMaximumConcurrency,
 // and every lane is drawn from that same bounded pool. The array is sized by that same constant.
+struct KvMemScoreBindingRegistry {
+    std::mutex mutex;
+    std::array<std::shared_ptr<KvMemScoreProbe>, ninfer::kMaximumConcurrency> bound{};
+};
+
+inline KvMemScoreBindingRegistry& kvmem_score_binding_registry() {
+    static KvMemScoreBindingRegistry registry;
+    return registry;
+}
+
 inline KvMemScoreProbe& kvmem_score_probe(std::uint32_t lane) {
-    static std::array<KvMemScoreProbe, ninfer::kMaximumConcurrency> probes;
-    return probes[lane];
+    static thread_local std::array<std::shared_ptr<KvMemScoreProbe>,
+                                    ninfer::kMaximumConcurrency> local;
+    static thread_local std::array<KvMemScoreProbe, ninfer::kMaximumConcurrency> fallback;
+    auto& registry = kvmem_score_binding_registry();
+    {
+        std::lock_guard lock(registry.mutex);
+        local[lane] = registry.bound[lane];
+    }
+    return local[lane] != nullptr ? *local[lane] : fallback[lane];
+}
+
+inline void kvmem_score_bind(std::uint32_t lane,
+                             std::shared_ptr<KvMemScoreProbe> probe,
+                             KvMemLrfuRound* round) {
+    if (probe != nullptr) { probe->lrfu = round; }
+    auto& registry = kvmem_score_binding_registry();
+    std::lock_guard lock(registry.mutex);
+    registry.bound[lane] = std::move(probe);
+}
+
+inline void kvmem_score_unbind(std::uint32_t lane,
+                               const std::shared_ptr<KvMemScoreProbe>& probe) noexcept {
+    auto& registry = kvmem_score_binding_registry();
+    std::lock_guard lock(registry.mutex);
+    if (registry.bound[lane] == probe) { registry.bound[lane].reset(); }
 }
 
 // LOCAL (2026-10-02, the caller step): the block ids selected by the most recent kvmem_score_finish().
@@ -414,8 +454,8 @@ inline void kvmem_score_accumulate(std::uint32_t lane, std::int32_t fidx, const 
     }
     if (!span_applied && query_tail > 0 && chunk_tokens > 0) {
         const std::int32_t tail = query_tail < chunk_tokens ? query_tail : chunk_tokens;
-        span_begin  = chunk_tokens - tail;
-        span_tokens = tail;
+        span_begin    = chunk_tokens - tail;
+        span_tokens   = tail;
     }
     // LOCAL FIX (B05): a span longer than MAXQ used to be skipped outright -- the scorer did nothing
     // for that chunk, the ring fell back to the lexical ranking, and the symptom was a retrieval that
@@ -523,12 +563,9 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
     KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (!p.armed || p.failed || p.n_blocks <= 0) { return; }
     p.armed = false;
-    // ★ D3（2026-10-15）：没打分的 chunk 直接丢弃、永不 commit（P0-4 修掉的"幽灵轮"）。
-    //   注意顺序：先 return 之前**不**碰 lrfu —— 上轮的 candidate 留给下一个真打分的 finish
-    //   去 commit（"先 commit 上轮，再 preview 本轮"）；decode 从不调 begin/finish，不推进轮次。
+    // Unscored chunks publish no evidence; Program decides the accept boundary.
     if (!p.scored_this_chunk) {
-        if (kvmem_lrfu_enabled()) { kvmem_lrfu_discard(p.lrfu); }
-        return;   // 本 chunk 没打过（如长 ingest）⇒ 不打印全零假日志
+        return;   // 未打分不改变 LRFU candidate，也不推进轮次。
     }
     // ★ 出处登记（2026-09-26 语义档的准入闸）：这份分数描述块 [0, n_blocks)，且来自**最近一个
     //   chunk 的 query**。语义档只在 scored_last_chunk 为真时才用它装窗（宁可退压力档，也不装
@@ -557,7 +594,9 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
     }
 
     double sum_score = 0.0;
-    for (std::int32_t i = 0; i < p.n_blocks; ++i) { sum_score += static_cast<double>(p.score_host[i]); }
+    for (std::int32_t i = 0; i < p.n_blocks; ++i) {
+        sum_score += static_cast<double>(p.score_host[i]);
+    }
 
     KvMemSelectConfig scfg;
     scfg.total_blocks  = p.n_blocks;
@@ -570,37 +609,50 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
     // previous selection intact instead of emptying it.
     p.kept = sel.kept;
 
-    // ★ D3（2026-10-15）：finish 内先 commit 上轮、再 preview 本轮（P0-4：轮次只在提交时推进）。
-    //   上轮 candidate 在这里变成 committed；本轮 D2H 分数变成新的 candidate。kept 仍由当轮
-    //   selector 产生（上面），LRFU 只影响后续的重排键 —— ks 绝不写回 set_retrieval_scores
-    //   信号（D1 的另一半，见 select_retrieval_pages 内容路）。
-    //   LRFU 关时：零成本（一次 env 读 + 直接返回，ks 全空，lrfu_score 恒 0）。
-    bool          lrfu_on    = kvmem_lrfu_enabled();
-    std::uint64_t lrfu_round = p.lrfu.ks_round;
-    if (lrfu_on) {
-        (void)kvmem_lrfu_commit(p.lrfu);  // 上轮 candidate → committed（无 candidate 时 no-op）
-        lrfu_round = p.lrfu.ks_round;
-        kvmem_lrfu_preview(p.lrfu, p.score_host.data(), static_cast<std::size_t>(p.n_blocks),
-                           kvmem_lrfu_lambda(), kvmem_lrfu_top_frac());
+    // Program owns begin/accept/abort; finish only adds eligible evidence.
+    // LRFU changes the secondary ranking key, never the immediate selector signal.
+    const bool lrfu_on = kvmem_lrfu_enabled();
+    std::uint64_t lrfu_round = 0;
+    if (lrfu_on && p.lrfu != nullptr) {
+        // Only evidence from the declared query may update history. Tail fallback
+        // remains available to the immediate selector, but cannot replace query evidence.
+        const auto begin = p.abs_chunk_begin + p.query_span_begin;
+        const auto end = begin + p.query_span_tokens;
+        const bool eligible = kvmem_lrfu_coverage_eligible(
+            begin, end, p.abs_query_begin, p.abs_query_end);
+        if (eligible) {
+            const bool added = kvmem_lrfu_round_add(*p.lrfu, p.lrfu->token,
+                p.abs_chunk_begin + p.query_span_begin,
+                p.abs_chunk_begin + p.query_span_begin + p.query_span_tokens,
+                p.score_host.data(), static_cast<std::size_t>(p.n_blocks),
+                kvmem_lrfu_lambda(), kvmem_lrfu_top_frac());
+            if (!added) {
+                std::fprintf(stderr, "[lrfu] evidence-rejected token=%llu coverage=[%d,%d)\n",
+                             static_cast<unsigned long long>(p.lrfu->token),
+                             p.abs_chunk_begin + p.query_span_begin,
+                             p.abs_chunk_begin + p.query_span_begin + p.query_span_tokens);
+            }
+        }
+        lrfu_round = p.lrfu->preview.ks_round + (p.lrfu->preview.has_candidate ? 1 : 0);
     }
 
     // ★ KS 轨迹审计（LRFU 开时）：打出 committed KS 最大的前 8 个块（id:ks），供"换问后旧块
     //   衰减 0.9→0.45 量级"的抽查。关时不打（负控日志逐位旧行为，只多 agg=/lrfu= 两个后缀）。
-    if (lrfu_on && !p.lrfu.ks.empty()) {
-        std::vector<std::uint32_t> order(p.lrfu.ks.size());
+    if (lrfu_on && p.lrfu != nullptr && !p.lrfu->preview.ks.empty()) {
+        std::vector<std::uint32_t> order(p.lrfu->preview.ks.size());
         for (std::uint32_t i = 0; i < order.size(); ++i) { order[i] = i; }
         std::partial_sort(order.begin(),
                           order.begin() + static_cast<std::ptrdiff_t>(
                                               std::min<std::size_t>(order.size(), 8)),
                           order.end(), [&](std::uint32_t a, std::uint32_t b) {
-                              return p.lrfu.ks[a] != p.lrfu.ks[b] ? p.lrfu.ks[a] > p.lrfu.ks[b]
+                              return p.lrfu->preview.ks[a] != p.lrfu->preview.ks[b] ? p.lrfu->preview.ks[a] > p.lrfu->preview.ks[b]
                                                                   : a < b;
                           });
         std::fprintf(stderr, "kvmem_score: KS_TOP round=%llu",
                      static_cast<unsigned long long>(lrfu_round));
         for (std::size_t i = 0; i < order.size() && i < 8; ++i) {
             std::fprintf(stderr, " %u:%.4f", order[i],
-                         static_cast<double>(p.lrfu.ks[order[i]]));
+                         static_cast<double>(p.lrfu->preview.ks[order[i]]));
         }
         std::fprintf(stderr, "\n");
     }
@@ -652,7 +704,8 @@ inline void kvmem_score_finish(std::uint32_t lane, const char* label,
 inline float kvmem_score_lrfu_score(std::uint32_t lane, std::int32_t block) noexcept {
     const KvMemScoreProbe& p = kvmem_score_probe(lane);
     if (block < 0) { return 0.0f; }
-    return kvmem_lrfu_score(p.lrfu, static_cast<std::size_t>(block));
+    return p.lrfu != nullptr ? kvmem_lrfu_score(p.lrfu->preview, static_cast<std::size_t>(block))
+                             : 0.0f;
 }
 
 // LRFU 是否开着（内容路用：开时按 lrfu_score 重排，关时按当轮分 —— 负控逐位旧行为）。
@@ -678,7 +731,8 @@ inline float kvmem_score_rank_key(std::uint32_t lane, const std::vector<float>& 
 
 // LRFU 已提交轮数（KS 轨迹审计：换问后旧块衰减 0.9→0.45 量级的抽查口）。
 inline std::uint64_t kvmem_score_lrfu_round(std::uint32_t lane) noexcept {
-    return kvmem_score_probe(lane).lrfu.ks_round;
+    const auto* round = kvmem_score_probe(lane).lrfu;
+    return round != nullptr ? round->preview.ks_round : 0;
 }
 
 // 逐块分数导出（给离线判据用：核对"含针的块"有没有被选中）。只在 switch 打开且本 chunk 打过时写。

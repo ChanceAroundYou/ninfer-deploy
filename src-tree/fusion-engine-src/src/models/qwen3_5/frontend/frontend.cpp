@@ -453,6 +453,7 @@ PreparedContextCache prepare_context_cache(
         throw std::invalid_argument("context cache retention hint is invalid");
     }
     out.update_session_index = hints.update_session_index;
+    out.continue_retrieval_history = hints.continue_retrieval_history;
 
     for (const PromptCacheMarker marker : hints.markers) {
         switch (marker.kind) {
