@@ -263,3 +263,117 @@ ctest -R '^ninfer_(kvmem_lrfu|resource_manager|openai_schema|qwen3_5_frontend|co
 ```
 
 结果：6/6 通过（1.48 s），另 `git diff --check` 通过。
+
+---
+
+## 10. 合并后六臂全量 + 五项验收（2026-10-16，A/B 合并后）
+
+### 前置：被测产物确实是被提交的那棵树
+
+六臂跑的是隔离 scratch build，**不是** `build-selfcontained`（后者早于两个提交，且属不动项）。
+声称"测的是合并产物"之前先证明它：
+
+- `git archive HEAD src-tree/fusion-engine-src` 展开后与远端 `kvmem-lrfu-lifecycle/source`
+  逐文件 sha256 对比：**2473 / 2473 文件，零差异**。
+- 产物 `build/apps/ninfer-serve` sha256 前缀 `1c6b08b6b9b484e8`，构建于 10-16 14:00。
+- 远端构建目录 `CMakeCache.txt` 的 `ninfer_SOURCE_DIR` 正是该 source 树。
+
+### 配方
+
+与 §1 同（GPU4 `:18492`、池 16384 token=256 页、`RETRIEVE=1024`=16 页、80 filler + 8 散布针、
+每臂冷启动），唯一新增：`NINFER_TERNARY_KVMEM_SCORE_AGG` 与 `NINFER_TERNARY_KVMEM_ACTION_SPAN`。
+脚本 `ai:/tmp/arm6.sh` + `ai:/tmp/arm6_all.sh`，结果 `/tmp/cp3_m6-*.out`，日志 `/tmp/gpu4-m6-*.log`。
+
+**G4 的解释**：六臂按指令只由两轴定义（agg × action），G4 保持**默认关**——否则预算变了，
+与 §2 的既有基线（Mean 2–6/8、Max 4/8、Max+LRFU 1–4/8）不再可比。但"G4 读数"在关档下是空的
+（`gate=off`），故**额外加跑一臂**（与 `m6-maxlrfu-on` 逐项相同，仅打开 `RETRIEVE_MAX=8192`）
+以产生真实读数。这一臂是附加项，不属于六臂，也不作门槛。
+
+### 结果
+
+| # | 臂 | agg | lrfu | action | 严格召回 | 命中集 |
+|---|---|---|---|---|---|---|
+| 1 | `m6-mean-off` | mean | off | off | **6/8** | safe code, city, coffee, plate, mentor, instrument |
+| 2 | `m6-mean-on` | mean | off | **on** | **6/8** | 与 #1 **逐位相同** |
+| 3 | `m6-max-off` | max | off | off | **4/8** | city, coffee, mentor, instrument |
+| 4 | `m6-max-on` | max | off | **on** | **4/8** | 与 #3 **逐位相同** |
+| 5 | `m6-maxlrfu-off` | max | **on** | off | **2/8** | mentor, instrument |
+| 6 | `m6-maxlrfu-on` | max | **on** | **on** | **4/8** | city, coffee, mentor, instrument |
+| + | `m6-g4on-maxlrfu-on`（附加） | max | on | on + **G4** | **6/8** | safe code, city, **cat**, coffee, plate, mentor |
+
+每臂均为 88 请求 / 439 SELECT / 439 KEPT / `oracle_fail=0`。
+
+**证据行（逐臂核对，与名义配置一致）**
+
+| 臂 | span_mode | ACTION 行 | agg/lrfu |
+|---|---|---|---|
+| 1,3 | `abs:16 tail:423` | 0 | `agg=mean\|max lrfu=off` |
+| 2,4 | `action:174 tail:265` | **1** | `agg=mean\|max lrfu=off` |
+| 5 | `abs:16 tail:423` | 0 | `agg=max lrfu=on` |
+| 6,+ | `action:174 tail:265` | **87** | `agg=max lrfu=on` |
+
+### 结论
+
+**(1) Max 相对 Mean 仍无召回收益。** 4/8 对 6/8，且 Max 两臂命中集与 §2 的三次冷启动逐位相同
+（city、coffee、mentor、instrument）——**跨合并复现**了 §3(1) 的结论。
+
+**(2) G3 动作区接线成立，但对本 fixture 的召回是中性的。** action 开档把 `span_mode` 从
+`abs/tail` 换成 `action:174`，且产生了真实的 ACTION 证据行
+（`src=prompt_assistant abs=[1750,1757) tail_n=4 -> local [0,4) of chunk [1750,1754)`）。
+但 #1↔#2、#3↔#4 的命中集**逐位相同**：改"拿什么去检索"在这档压力下没有可测的召回差异。
+
+**(3) 本 fixture 没有行使 LRFU 的跨请求历史——这是设计使然，不是缺陷。** 三个 LRFU 臂的谱系
+完全一致：`begin=89 / accept=89`，`source=neutral ×89`、`private-checkpoint ×0`、
+`max base_round=0`、`max round=1`、`evidence-rejected=0`。原因是 fixture 只发
+`{model, messages}`，**不带 session key**，而 `continue_retrieval_history` 默认关且要求非空
+session key ⇒ 每个请求都从 neutral 起。所以这六臂测的是 LRFU 的**单轮**行为，
+**不能**用来声称 A 的跨请求记忆成立——那一项由 §9 的最小链路复测负责（那里 88/94 次
+`source=private-checkpoint`）。**两者的结论不可互相替代。**
+
+**(4) 探针生命周期在 LRFU 关档下仍是"每 lane 跨请求"的（本次新发现）。**
+`prefill.cpp:270` 只在 `kvmem_lrfu_enabled()` 为真时创建并绑定
+`sequence.kvmem_score_workspace`；关档时 `kvmem_score_probe()` 回落到
+`thread_local fallback[lane]`，该对象**进程内按 lane 常驻**。可观测症状就是上表的
+ACTION 行 **1 vs 87**：`logged_action_span` 是探针字段，只喊一次，关档下永远只喊那一次。
+承重字段（`armed`/`scored_this_chunk`/`scored_last_chunk`）每 chunk 由 `kvmem_score_begin`
+重置，`action_*`/`abs_*`/`chunk_origin` 由 driver 每 chunk 重发，所以**本次未观察到打分污染**
+（各臂 439 SELECT、`oracle_fail=0`）。但 A 引入的"每请求状态"目前**只在 LRFU 档上成立**，
+关档路径的状态归属与设计意图（"lane 只是执行槽，不是历史 owner"）不一致。记为待修，
+不阻塞本次合并。
+
+**(5) 实验混杂项，必须写明。** LRFU 开/关**同时**改变了探针生命周期（见 (4)），
+所以 #3(4/8) 与 #5(2/8) 的差异**不能**单独归因于 LRFU 数学；§4 记录的双稳态
+（同配置 2/8 ↔ 6/8 逐位可复现）也足以解释这个量级的摆动。样本均为单次冷启动。
+
+**(6) G4 读数（只记录，不作门槛）。** 附加臂 `gate` 行：`cur` 由 16 爬到 **128（=upper）**，
+`margin=0.0000` 触发增长、冷却置 0；计数 `hold cur=128 margin=0.0000`×802、
+`cur=128 margin=n/a`×52、`cur=16 margin=n/a`×30。同配置下召回 4/8 → 6/8，
+与 §3(2)"真正的杠杆是恢复预算"同向。**单样本，不作结论。**
+
+### 五项验收（GPU4 `:18492`，生产五项口径）
+
+脚本 `ai:/tmp/accept5.sh`，跑全开档（Max + LRFU + action），日志 `/tmp/accept5.out`。
+
+| 阶段 | 检查 | 结果 |
+|---|---|---|
+| 1 health | `GET /health` | PASS `{"status":"ok"}` |
+| 2 metrics | `GET /metrics` | PASS http=200，3761 B |
+| 3 真实生成 | `POST /v1/chat/completions` | PASS `finish_reason=stop`，content 非空 |
+| 4 controlled restart | 按精确 PID 停 → 重启 | PASS 退出 **13 s**、端口释放、新 PID 不同、重启后 ready |
+| 5 三行齐 | SELECT / KEPT / oracle | PASS `SELECT=9 KEPT=9 ACTION=1 oracle_fail=0`，`span_mode` action×2 / tail×7 |
+
+**`PASS=11 FAIL=0`。**
+
+两个**测试脚手架**的坑（都不是引擎缺陷，但会让验收假红，记录备查）：
+1. **"listening on" ≠ 就绪**。端口已开、`/v1/models` 已 200，模型仍在加载，`/health` 返回
+   503 `model_loading`。必须以 `/health` 轮询为准。
+2. **端口释放 ≠ 进程退出**，且**别用 pgrep 模式判"是否退出"**。第一次按 2 s 固定 sleep 判，
+   假红；第二次按 pgrep 模式判 80 s，仍假红——而单独实测 SIGTERM→进程消失为 **13–14 s**。
+   改为对**精确数字 PID** 做 `kill -0` 轮询后通过。
+
+### 收工状态
+
+GPU4 13 MiB、0 个 compute app；`:18492` 无 listener、无进程；生产 `:18471` `/health` 正常且
+PID 2927765 **未变**（全程未重启）；`:18790` WebUI 正常；`build-selfcontained`、
+`runtime/build-current`、`build-ninfer-sm86-clean` 三个目录均在。未推送。
+
