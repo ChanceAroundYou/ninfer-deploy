@@ -1570,6 +1570,8 @@ profile never restores another's KV. `--disk-kv-gib` (default 64) is the total b
 used page goes first. The files are sparse until written, and a torn page fails its CRC and reads as
 a miss.
 
+**Boundary with the KVMem ring.** The KVMem ring (enabled by `NINFER_KV_REUSE_HOSTBACKED=1`) cycles KV pages between Device VRAM and pinned Host RAM only; it never reads from or writes to the disk tier, and disk availability does not affect ring admission or eviction. A request admitted by the ring is bounded by VRAM and pinned host RAM alone. The disk tier is an orthogonal persistence layer for evicted continuations and is consulted only when `--disk-kv-restore` is set.
+
 With `--disk-kv-restore`, a request with no resident prefix looks for the longest frontier `E` on
 disk whose StateImage and KV chain match its own prompt, is admitted as reusing `E`, and has `[0, E)`
 copied into its sequence before prefill starts at `E`; under MTP the StateImage's hidden state
