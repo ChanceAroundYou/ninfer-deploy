@@ -2813,9 +2813,11 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
             }
             std::fprintf(stderr,
                          "[ring] budgets: skeleton=%u, evidence=%u, recent=%u, free=%u "
+                         "neighbor=%u "
                          "(lane pool %u of %u across %u lane(s)) "
                          "[skeleton+evidence+recent+free == lane pool: %s] %s\n",
-                         b_skeleton, b_evidence, b_recent, b_free, lane_pool, pool, max_concurrency,
+                         b_skeleton, b_evidence, b_recent, b_free, proto_kv_neighbor_pages(),
+                         lane_pool, pool, max_concurrency,
                          (b_skeleton + b_evidence + b_recent + b_free) == lane_pool ? "yes" : "NO",
                          gate_suffix);
         }
