@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <utility>
+#include <functional>
 #include <vector>
 
 namespace ninfer::ops::detail {
@@ -69,12 +70,58 @@ inline std::vector<std::uint32_t> add_seam_neighbors(std::vector<std::uint32_t> 
     return out;
 }
 
+// D2 (Stage 5, 2026-10-17): score-gated seam completion. Same walk as add_seam_neighbors, but a seam
+// neighbour is only bought when its own score clears `threshold` (or it is the evidence page itself).
+// This turns the fixed 2*reach width tax into a data-dependent one: pages the scorer did not value are
+// not pulled in just because they sit next to a kept page. `score_of(page)` returns the page's ranking
+// score (0 if absent); `threshold` is typically the cut score * 0.5.
+inline std::vector<std::uint32_t> add_seam_neighbors_gated(
+    std::vector<std::uint32_t> ranked, std::uint32_t begin, std::uint32_t end,
+    std::uint32_t budget, std::uint32_t reach,
+    const std::function<float(std::uint32_t)>& score_of, float threshold) {
+    std::vector<std::uint32_t> out;
+    if (reach == 0 || budget == 0 || ranked.empty()) { return ranked; }
+    out.reserve(ranked.size() + 2U * reach * ranked.size());
+    const auto contains = [](const std::vector<std::uint32_t>& pages, std::uint32_t page) {
+        return std::find(pages.begin(), pages.end(), page) != pages.end();
+    };
+    for (const std::uint32_t page : ranked) {
+        if (page < begin || page >= end) { continue; }
+        if (!contains(out, page)) { out.push_back(page); }
+        for (std::uint32_t step = 1; step <= reach; ++step) {
+            const std::uint32_t forward = page + step;
+            if (forward < end && !contains(out, forward) &&
+                (score_of == nullptr || score_of(forward) >= threshold)) {
+                out.push_back(forward);
+            }
+            if (out.size() >= budget) { break; }
+            const std::uint32_t backward = page >= step ? page - step : 0U;
+            if (page >= step && backward >= begin && !contains(out, backward) &&
+                (score_of == nullptr || score_of(backward) >= threshold)) {
+                out.push_back(backward);
+            }
+            if (out.size() >= budget) { break; }
+        }
+        if (out.size() >= budget) { break; }
+    }
+    if (out.size() > budget) { out.resize(budget); }
+    if (out.empty()) {
+        // fall back to the non-gated result's shape on degenerate input
+        out = ranked;
+        if (out.size() > budget) { out.resize(budget); }
+    }
+    return out;
+}
+
 // How thin the budget's boundary is. `ratio` = the gap at the cut divided by the typical gap above it;
 // the gate that reads it is ProgramImpl's RingBudgetMargin. Lives here rather than in program_impl.h so
 // the measurement can be qualified without constructing a Program.
 struct KvMemBudgetMargin {
     float ratio = 0.0F;
     bool  valid = false;
+    // D3 (Stage 5, 2026-10-17): number of seam neighbours that sat just below the budget cut.
+    // A high value means the budget line sliced through a cluster of related pages.
+    std::uint32_t neighbor_dropped = 0;
 };
 
 // LOCAL (G7/G4 ring adaptive budget, 2026-10-15): measure how thin the budget's boundary is.
