@@ -271,9 +271,11 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         // thread_local probe -- i.e. the previous request that ran on this lane (2026-10-16).
         sequence.kvmem_score_workspace = std::make_shared<ops::detail::KvMemScoreProbe>();
         ops::detail::kvmem_score_bind(lane, sequence.kvmem_score_workspace, &sequence.lrfu);
+        // A1: round_begin moved to select_retrieval_pages (per retrieval round). Here we only
+        // seed the history so select_retrieval_pages can open the round with it; token=0 keeps the
+        // round inactive until a retrieval actually happens.
         if (ops::detail::kvmem_lrfu_enabled()) {
-            ops::detail::kvmem_lrfu_round_begin(sequence.lrfu, lane_epochs[lane],
-                                               std::move(retrieval_history));
+            ops::detail::kvmem_lrfu_round_begin(sequence.lrfu, 0, std::move(retrieval_history));
             std::fprintf(stderr, "[lrfu] begin lane=%u token=%llu base_round=%llu source=%s\n",
                          lane, static_cast<unsigned long long>(sequence.lrfu.token),
                          static_cast<unsigned long long>(sequence.lrfu.preview.ks_round),

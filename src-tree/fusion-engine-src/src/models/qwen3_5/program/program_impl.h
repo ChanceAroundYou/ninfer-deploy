@@ -1717,7 +1717,7 @@ private:
     // `valid == false` when the cut decided nothing -- nothing kept, or nothing dropped because the budget
     // covered the whole range. The caller must read `valid`, not the ratio: a cleared reading means the
     // budget was not binding here, so there is no thinness to act on.
-    [[nodiscard]] std::vector<std::uint32_t> select_retrieval_pages(const SequenceState& sequence,
+    [[nodiscard]] std::vector<std::uint32_t> select_retrieval_pages(SequenceState& sequence,
                                                                     std::uint32_t begin,
                                                                     std::uint32_t end,
                                                                     std::uint32_t budget,

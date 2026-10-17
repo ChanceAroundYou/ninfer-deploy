@@ -1682,7 +1682,7 @@ std::uint32_t proto_kv_neighbor_pages() {
 // indices. The score is an inverse-document-frequency weighted token overlap, which is what makes
 // a rare match (a variable name, an error string, a code) dominate ordinary function words. Token
 // ids live on the Host in the sequence ledger, so this needs no Device work.
-std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceState& sequence,
+std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(SequenceState& sequence,
                                                               std::uint32_t begin,
                                                               std::uint32_t end,
                                                               std::uint32_t budget,
@@ -1695,6 +1695,17 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceSta
     if (margin_out != nullptr) {
         margin_out->ratio = 0.0F;
         margin_out->valid = false;
+    }
+    // A1: open a retrieval round per select_retrieval_pages call (not per prefill chunk), so
+    // history decays per retrieval round instead of per chunk. Only when LRFU is enabled; otherwise
+    // the round is left inactive (token==0) and round_add is a no-op.
+    if (ops::detail::kvmem_lrfu_enabled()) {
+        std::uint64_t next_token = sequence.lrfu.token + 1;
+        if (next_token == 0) { ++next_token; }
+        ops::detail::kvmem_lrfu_round_begin(sequence.lrfu, next_token, sequence.lrfu.history);
+        std::fprintf(stderr, "[lrfu] round_boundary seq_token=%llu round=%llu\n",
+                     static_cast<unsigned long long>(sequence.lrfu.token),
+                     static_cast<unsigned long long>(sequence.lrfu.preview.ks_round));
     }
     if (budget == 0 || end <= begin) { return selected; }
     // ---- LOCAL (KVMem content scoring, 2026-10-02) ---------------------------------------------
