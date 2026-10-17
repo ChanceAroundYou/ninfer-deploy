@@ -30,3 +30,9 @@ Thumbs.db
 !*.env.example
 qdl.env
 quark-downloads/
+
+# Upstream data fixtures untracked in this fork (large / regenerable)
+src-tree/fusion-engine-src/tools/freq_corpus/fixtures/
+src-tree/fusion-engine-src/eval/corpora/
+src-tree/fusion-engine-src/bench/fixtures/
+src-tree/fusion-engine-src/examples/cli/messages/long_niah_*.json
