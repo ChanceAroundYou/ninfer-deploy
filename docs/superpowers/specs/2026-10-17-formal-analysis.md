@@ -26,3 +26,17 @@
 - 所有代码变更编译通过，host tests 3/3 通过
 - 设备 B 实例运行正常
 - 生产配置不变，等待 D4 arm 验证
+
+## D4 验证结果（2026-10-17 追加）
+
+运行环境：设备 B GPU4，冷启动，A1/D1-D3 新 binary（sha 08eaf5454b2d...）。
+
+| 臂 | B(页) | R | agg | recall |
+|---|---|---|---|---|
+| b16_r0_mean | 16 | 0 | mean | 6/8 |
+| b64_r0_mean | 64 | 0 | mean | 8/8 |
+
+与 §11 历史读数一致（B=16 6/8、B=64 8/8），新代码未引入回归；双稳态 across B/R/agg/lrfu 全矩阵仍需进一步运行，当前证据不足以翻默认值。
+
+### 生产决策（更新）
+保持 ring OFF / RETRIEVE=3072 / NEIGHBOR_PAGES=0 / Max/LRFU/G3/G4 gated OFF。翻默认值条件未满足。
