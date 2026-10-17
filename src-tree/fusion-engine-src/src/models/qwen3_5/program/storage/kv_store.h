@@ -1202,7 +1202,9 @@ public:
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
             if (pages_->writer_references(logical) != 0) { pages_->set_writer(logical, false); }
-            release_device_residency_hold(handle, page);
+            if (!release_device_residency_hold(handle, page)) {
+                throw std::logic_error("KV deactivation is missing a Device residency hold");
+            }
         }
         address.row.reset();
         address.reservation.release();
@@ -1916,10 +1918,13 @@ public:
             }
         }
         while (address.page_count > target) {
-            const std::uint32_t index  = --address.page_count;
+            const std::uint32_t index = address.page_count - 1U;
+            if (!release_device_residency_hold(handle, index)) {
+                throw std::logic_error("KV truncate is missing a Device residency hold");
+            }
             LogicalKVPageHandle page   = membership(address, index);
             membership(address, index) = {};
-            release_device_residency_hold(handle, index);
+            --address.page_count;
             pages_->dematerialize(page, address.reservation);
         }
         if (target != 0) {
@@ -2083,6 +2088,10 @@ public:
             throw std::out_of_range("KV logical page is outside the address space");
         }
         return membership(address, logical_page);
+    }
+
+    [[nodiscard]] bool has_active_reference(LogicalKVPageHandle logical) const noexcept {
+        return pages_->active_address_references(logical) != 0;
     }
 
     [[nodiscard]] bool has_device_residency_hold(KVAddressSpaceHandle handle,

@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/ring_demotion.h"
 #include "models/qwen3_5/program/storage/ring_lane_budget.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
@@ -1831,11 +1832,10 @@ std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(SequenceState& se
     return selected;
 }
 
-std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& addresses,
-                                                          LogicalKVPageStore& pages,
-                                                          const KVAddressSpaceHandle& skip,
-                                                          std::uint32_t target_free) {
-    if (host_kv_extents == nullptr || target_free == 0) { return 0; }
+std::uint32_t demote_inactive_addresses_to_host(
+    HostKVExtentStore& host_kv_extents, cudaStream_t stream, KVAddressSpaceStore& addresses,
+    LogicalKVPageStore& pages, const KVAddressSpaceHandle& skip, std::uint32_t target_free) {
+    if (target_free == 0) { return 0; }
     std::uint32_t freed = 0;
     std::uint32_t slots_visited = 0, skip_invalid = 0, skip_noresident = 0, skip_active_hold = 0,
                   skip_pins = 0, skip_activation = 0, skip_stalehost = 0, skip_partial = 0,
@@ -1855,17 +1855,16 @@ std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& a
     batch.reserve(64);
     const auto flush = [&]() -> bool {
         if (batch.empty()) { return true; }
-        std::optional<HostKVExtentReservation> reserved = host_kv_extents->prepare(pages, batch);
+        std::optional<HostKVExtentReservation> reserved = host_kv_extents.prepare(pages, batch);
         if (!reserved) { ++flush_failed; return false; }   // Host arena full: nothing more can be moved
-        const std::vector<DeviceKVPageHandle> sources = host_kv_extents->device_sources(*reserved);
+        const std::vector<DeviceKVPageHandle> sources = host_kv_extents.device_sources(*reserved);
         // Copy on the compute stream so the D2H is ordered after the kernels that wrote them.
-        pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reserved),
-                                           device.stream);
+        pages.physical_pool().copy_to_host(sources, host_kv_extents.writable_view(*reserved), stream);
         // LOCAL FIX (2026-10-02): publish declines instead of terminating, so this batch simply does
         // not happen -- every Device page in it keeps its replica and its active reference (the loop
         // below never runs), i.e. the data is intact and the ring can try again later. Same shape as
         // the `prepare` refusal just above, with its own counter so the log names the real reason.
-        if (!host_kv_extents->publish(std::move(*reserved))) {
+        if (!host_kv_extents.publish(std::move(*reserved))) {
             ++flush_declined;
             return false;
         }
@@ -1957,6 +1956,15 @@ std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& a
                      skip_duplicate, flush_failed, flush_declined, batch.size());
     }
     return freed;
+}
+
+std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& addresses,
+                                                          LogicalKVPageStore& pages,
+                                                          const KVAddressSpaceHandle& skip,
+                                                          std::uint32_t target_free) {
+    if (host_kv_extents == nullptr) { return 0; }
+    return demote_inactive_addresses_to_host(*host_kv_extents, device.stream, addresses, pages, skip,
+                                              target_free);
 }
 
 std::uint32_t ProgramImpl::demote_kv_pages_to_host(KVAddressSpaceStore& addresses,

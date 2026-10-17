@@ -1,6 +1,5 @@
 #include "core/device.h"
-#include "models/qwen3_5/program/storage/host_kv_store.h"
-#include "models/qwen3_5/program/storage/kv_store.h"
+#include "models/qwen3_5/program/storage/ring_demotion.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 
 #include "models/qwen3_5/state/state_image.h"
@@ -807,6 +806,75 @@ void test_abandoned_stores_return_resources(ninfer::DeviceContext& device) {
            "Host StateImage release_all frees every slot and stales outstanding handles");
 }
 
+void test_inactive_shared_fork_demotion_keeps_active_replica(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    const auto source = addresses.create_active(3, 0, {});
+    expect(source.has_value(), "inactive shared-fork source allocation");
+    addresses.ensure_mapped_to_tokens(*source, 64, device.stream);
+    device.synchronize();
+    addresses.commit_frontier(*source, 64);
+    addresses.set_checkpoint_requirement(*source, 64);
+    addresses.deactivate(*source);
+    const auto shared_page = addresses.logical_page(*source, 0);
+
+    const auto active_fork = addresses.create_inactive();
+    expect(active_fork.has_value(), "inactive shared-fork destination allocation");
+    auto fork = addresses.prepare_prefix_fork(*source, *active_fork, 64, 3, 1);
+    expect(!fork.needs_tail_copy(), "page-aligned shared fork requires no private tail copy");
+    addresses.commit_prefix_fork(std::move(fork), device.stream);
+    device.synchronize();
+
+    expect(!addresses.active(*source) && addresses.active(*active_fork) &&
+               addresses.logical_page(*active_fork, 0) == shared_page &&
+               pages.device_resident(shared_page) && !pages.host_resident(shared_page) &&
+               pages.committed_columns(shared_page) == static_cast<std::uint32_t>(ninfer::kPagedKVPageSize) &&
+               pages.source_pins(shared_page) == 0 && pages.activation_pins(shared_page) == 0 &&
+               pages.can_pin_source(shared_page) &&
+               pages.active_address_references(shared_page) == 1 && host_arena.occupied_bytes() == 0,
+           "inactive source and active fork share one Device-only full page");
+
+    const std::uint32_t freed = store::demote_inactive_addresses_to_host(
+        extents, device.stream, addresses, pages, *active_fork, 1);
+
+    expect(freed == 0 && pages.device_resident(shared_page) && !pages.host_resident(shared_page) &&
+               pages.active_address_references(shared_page) == 1 &&
+               addresses.logical_page(*source, 0) == shared_page &&
+               addresses.logical_page(*active_fork, 0) == shared_page &&
+               host_arena.occupied_bytes() == 0,
+           "demoting an inactive shared source does not copy, publish, or drop its active fork replica");
+
+    addresses.deactivate(*active_fork);
+    expect(addresses.release(*active_fork) && addresses.release(*source) && pages.occupied() == 0 &&
+               physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0 &&
+               host_arena.occupied_bytes() == 0,
+           "shared-fork demotion fixture returns all resources");
+}
+
 } // namespace
 
 int main() {
@@ -822,6 +890,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_inactive_shared_fork_demotion_keeps_active_replica(device);
         test_pending_activation_holds_device_replicas(device);
         test_abandoned_stores_return_resources(device);
         device.synchronize();
