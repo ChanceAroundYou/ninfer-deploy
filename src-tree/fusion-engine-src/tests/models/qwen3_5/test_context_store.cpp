@@ -849,8 +849,19 @@ void test_inactive_shared_fork_demotion_keeps_active_replica(ninfer::DeviceConte
     addresses.commit_prefix_fork(std::move(fork), device.stream);
     device.synchronize();
 
-    expect(!addresses.active(*source) && addresses.active(*active_fork) &&
+    addresses.deactivate(*active_fork);
+    const auto second_active_fork = addresses.create_inactive();
+    expect(second_active_fork.has_value(), "second active shared-fork destination allocation");
+    if (!second_active_fork) { return; }
+    auto second_fork = addresses.prepare_prefix_fork(*source, *second_active_fork, 64, 3, 1);
+    expect(!second_fork.needs_tail_copy(), "second page-aligned fork requires no private tail copy");
+    addresses.commit_prefix_fork(std::move(second_fork), device.stream);
+    device.synchronize();
+
+    expect(!addresses.active(*source) && !addresses.active(*active_fork) &&
+               addresses.active(*second_active_fork) &&
                addresses.logical_page(*active_fork, 0) == shared_page &&
+               addresses.logical_page(*second_active_fork, 0) == shared_page &&
                pages.device_resident(shared_page) && !pages.host_resident(shared_page) &&
                pages.committed_columns(shared_page) == static_cast<std::uint32_t>(ninfer::kPagedKVPageSize) &&
                pages.source_pins(shared_page) == 0 && pages.activation_pins(shared_page) == 0 &&
@@ -859,19 +870,30 @@ void test_inactive_shared_fork_demotion_keeps_active_replica(ninfer::DeviceConte
            "inactive source and active fork share one Device-only full page");
 
     const std::uint32_t freed = store::demote_inactive_addresses_to_host(
-        extents, device.stream, addresses, pages, *active_fork, 1);
+        extents, device.stream, addresses, pages, *second_active_fork, 1);
 
     expect(freed == 0 && pages.device_resident(shared_page) && !pages.host_resident(shared_page) &&
                pages.active_address_references(shared_page) == 1 &&
                addresses.logical_page(*source, 0) == shared_page &&
                addresses.logical_page(*active_fork, 0) == shared_page &&
+               addresses.logical_page(*second_active_fork, 0) == shared_page &&
                host_arena.occupied_bytes() == 0,
-           "demoting an inactive shared source does not copy, publish, or drop its active fork replica");
+           "demoting inactive aliases does not copy, publish, or drop an active fork replica");
 
-    addresses.deactivate(*active_fork);
-    expect(addresses.release(*active_fork) && addresses.release(*source) && pages.occupied() == 0 &&
-               physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0 &&
-               host_arena.occupied_bytes() == 0,
+    addresses.deactivate(*second_active_fork);
+    const std::uint32_t freed_after_holder_exit = store::demote_inactive_addresses_to_host(
+        extents, device.stream, addresses, pages, *second_active_fork, 1);
+
+    expect(freed_after_holder_exit == 1 && !pages.device_resident(shared_page) &&
+               pages.host_resident(shared_page) && pages.host_replica_current(shared_page) &&
+               pages.active_address_references(shared_page) == 0 &&
+               host_arena.occupied_bytes() == host_layout.page_stride,
+           "releasing the final active fork makes its inactive shared source demotable to Host");
+
+    expect(addresses.release(*second_active_fork) && addresses.release(*active_fork) &&
+               addresses.release(*source) && extents.release_unreferenced() == host_layout.page_stride &&
+               pages.occupied() == 0 && physical_pages.allocated_pages() == 0 &&
+               physical_pages.reserved_pages() == 0 && host_arena.occupied_bytes() == 0,
            "shared-fork demotion fixture returns all resources");
 }
 
