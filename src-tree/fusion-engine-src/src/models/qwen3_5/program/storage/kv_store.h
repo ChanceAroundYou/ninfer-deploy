@@ -1321,6 +1321,11 @@ public:
         pages_->physical_pool().resize_reservation(fork.page_reservation_, growth);
     }
 
+    // DESIGN BOUNDARY (do not work around): this path requires the source range [0, required_pages)
+    // to be fully resident on the Device (the block table below is published with the source's physical
+    // page indices). It therefore cannot use ROUTE 3 lazy adopt, unlike commit_activation. An
+    // over-subscribed prefix-adoption request fails cleanly per request (ContextCacheExhausted ->
+    // 429, counted in ninfer:context_cache_exhausted_requests_total); it never degrades.
     void commit_prefix_fork(KVPrefixForkReservation&& fork, RankStreams stream = {}) {
         require_prefix_fork(fork);
         Address& source                    = require(fork.source_);

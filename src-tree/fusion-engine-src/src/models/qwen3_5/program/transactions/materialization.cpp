@@ -888,6 +888,25 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             if (missing != 0) {
                 (void)demote_other_addresses_to_host(addresses, pages, address, missing);
             }
+            // Prefix adoption (source_reservation set) cannot defer: commit_prefix_fork (kv_store.h:1335-1345)
+            // requires the source range to be fully resident (its block table is published with the source's
+            // physical page indices). Refuse cleanly here, with a named reason, instead of letting
+            // materialize_one discover an empty pool inside the loop.
+            // Guard uses usable - allocated (physically materializable), NOT available_pages() (which also
+            // subtracts logical reservations): reservations are accounting promises, not physical pages.
+            const std::uint32_t materializable =
+                pages.physical_pool().usable_pages() > pages.physical_pool().allocated_pages()
+                    ? pages.physical_pool().usable_pages() - pages.physical_pool().allocated_pages()
+                    : 0U;
+            if (!defer && missing > materializable) {
+                throw ninfer::ContextCacheExhausted(
+                    "KVMem prefix adoption needs " + std::to_string(missing) + " resident page(s) but only " +
+                    std::to_string(materializable) + " are free (usable " +
+                    std::to_string(pages.physical_pool().usable_pages()) + ", allocated " +
+                    std::to_string(pages.physical_pool().allocated_pages()) +
+                    "). Prefix adoption requires the whole adopted range resident at once and cannot "
+                    "degrade. Raise --kv-capacity, lower --max-concurrency, or shorten the reused prefix.");
+            }
             if (source_reservation) {
                 pages.physical_pool().resize_reservation(reservation, missing);
             }

@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/storage/ring_lane_budget.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
 // LOCAL (KVMem content scoring, 2026-10-02): the scorer's published selection + scores. Header-only,
@@ -2104,6 +2105,12 @@ std::uint32_t proto_kv_retrieve_share_percent() {
     return percent;
 }
 
+// NOTE on the two room quantities (do not swap them):
+//   usable_pages() - allocated_pages()  = pages materialize_one() can still hand out  (physical)
+//   available_pages() = usable - (allocated + reserved) = pages we may still PROMISE          (accounting)
+// The ring's room checks (ensure_ring_room, the judge) ask the first question, so they use the first.
+// Planning paths (hybrid_program.cpp, context.cpp:2383/2389) ask the second, so they use available_pages().
+// Reservations are logical promises (paged_kv_cache.cpp:386-389) and never prune free_page_runs_.
 // ---- LOCAL (ring lanes, 2026-10-17): the ring's per-lane share of the Device page pool. -----------
 // WHY THE POOL HAS TO BE DIVIDED. The Device page pool is ONE store that every lane maps into, and a
 // lane can only demote ITS OWN pages: demote_kv_pages_to_host walks one address space, and
@@ -2117,22 +2124,9 @@ std::uint32_t proto_kv_retrieve_share_percent() {
 // Dividing by the lane count is what makes the sum fit: N lanes each staying inside pool/N never need
 // to take a page from each other. At one lane this is the whole pool -- the arithmetic the single-lane
 // ring has always run -- so the ON arm's numbers are unchanged by construction.
-[[nodiscard]] std::uint32_t ring_lane_pool_pages(std::uint32_t pool, std::uint32_t lanes) {
-    return pool / std::max(1U, lanes);
-}
-
-// A lane's resident ceiling: what it may hold on the Device at once. Below its share, not at it, so
-// the restore path always finds a free page -- and so the lanes' ceilings sum to less than the pool
-// even at max_concurrency, which is what keeps one lane's growth from becoming another's starvation.
-[[nodiscard]] std::uint32_t ring_lane_ceiling_pages(std::uint32_t lane_pool) {
-    return lane_pool > kRingSlackPages ? lane_pool - kRingSlackPages : 0U;
-}
-
-// What one lane must be able to hold for the configuration to be servable: its attention-sink pin,
-// its retrieval budget, and the slack. `budget` is passed in already capped by the lane's share.
-[[nodiscard]] std::uint32_t ring_lane_need_pages(std::uint32_t sink_pages, std::uint32_t budget) {
-    return sink_pages + budget + kRingSlackPages;
-}
+// (ring_lane_pool_pages / ring_lane_ceiling_pages / ring_lane_need_pages were here; moved to
+// ring_lane_budget.h, definitions below the anonymous namespace closes so tests can link them.)
+// ring_lane_ceiling_pages is replaced by ring_lane_dynamic_ceiling(pool, other_lanes_resident) below.
 
 // ---- LOCAL (G7/G4 ring adaptive budget, 2026-10-15) ------------------------------------------------
 // Readers for the budget gate. These deliberately do NOT reuse proto_env_pages or the "0 == unset"
@@ -2259,6 +2253,21 @@ void install_resident_selection(qwen3_5::PagedKVCache* cache, std::uint32_t span
     }
 }
 } // namespace
+
+// Per-lane ring arithmetic (definitions; declarations in ring_lane_budget.h).
+std::uint32_t ring_lane_pool_pages(std::uint32_t pool, std::uint32_t lanes) {
+    return pool / std::max(1U, lanes);
+}
+
+std::uint32_t ring_lane_need_pages(std::uint32_t sink_pages, std::uint32_t budget) {
+    return sink_pages + budget + kRingSlackPages;
+}
+
+std::uint32_t ring_lane_dynamic_ceiling(std::uint32_t pool, std::uint32_t other_lanes_resident) {
+    const std::uint32_t slack = kRingSlackPages;
+    if (pool <= slack + other_lanes_resident) { return 0U; }
+    return pool - slack - other_lanes_resident;
+}
 
 void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
                                            std::uint32_t backend_tokens) {
@@ -2458,32 +2467,34 @@ void ProgramImpl::validate_ring_lane_fit() const {
                               : 0U);
     }
     const std::uint32_t lane_need = ring_lane_need_pages(proto_kv_sink_pages(), budget);
+    // Minimal refusal: not even a single lane can hold its attention-sink pin plus the restore slack.
+    // Beyond this, over-subscription is tolerated -- a short request leaves share for other lanes, and
+    // an adoption request that needs its whole range resident at once fails cleanly per request
+    // (ContextCacheExhausted -> 429, counted in ninfer:context_cache_exhausted_requests_total).
+    if (proto_kv_sink_pages() + kRingSlackPages > pool) {
+        throw std::invalid_argument(
+            std::string("KVMem ring: the Device KV pool cannot hold even one lane's attention-sink "
+                        "pin plus restore slack. sink + slack = ") +
+            std::to_string(proto_kv_sink_pages()) + " + " + std::to_string(kRingSlackPages) +
+            " = " + std::to_string(proto_kv_sink_pages() + kRingSlackPages) +
+            " page(s), but the pool only has " + std::to_string(pool) + " page(s).\n"
+            "       Ways out: raise --kv-capacity, or lower NINFER_KV_SINK.");
+    }
     if (lane_need <= lane_pool) { return; }
-    throw std::invalid_argument(
-        std::string("KVMem ring: the Device KV pool is too small for this many lanes. The ring "
-                    "divides the pool by --max-concurrency, because a lane can only reclaim its own "
-                    "pages (another lane's pages are unreclaimable while its retrieval mask holds "
-                    "them), so each lane gets pool / lanes = ") + std::to_string(pool) + " / " +
-        std::to_string(lanes) + " = " + std::to_string(lane_pool) +
-        " page(s). One lane needs its attention-sink pin plus its retrieval budget plus " +
-        std::to_string(kRingSlackPages) + " page(s) of restore slack = " +
-        std::to_string(proto_kv_sink_pages()) + " + " + std::to_string(budget) + " + " +
-        std::to_string(kRingSlackPages) + " = " + std::to_string(lane_need) +
-        " page(s), which does not fit -- short by " + std::to_string(lane_need - lane_pool) +
-        " page(s) per lane.\n"
-        "       Ways out (pick one):\n"
-        "         1) raise --kv-capacity (in TOKENS, divided by " +
-        std::to_string(static_cast<unsigned>(kPagedKVPageSize)) + " to get pages) to at least " +
-        std::to_string(lane_need * lanes) + " page(s);\n"
-        "         2) lower --max-concurrency so each lane's share covers what it needs (at " +
-        std::to_string(std::max(1U, lane_need > 0 ? pool / lane_need : 1U)) + " lane(s) this pool "
-        "is sufficient);\n"
-        "         3) lower the per-lane demand: NINFER_KV_RETRIEVE (retrieval budget, in TOKENS), "
-        "NINFER_KV_SINK (attention-sink pin, in TOKENS), or NINFER_KV_RETRIEVE_SHARE (the share of "
-        "the lane's pool the budget may take, default 50).\n"
-        "       Current configuration: pool " + std::to_string(pool) + " page(s), max_concurrency " +
-        std::to_string(lanes) + ", NINFER_KV_SINK " + std::to_string(proto_kv_sink_pages()) +
-        " page(s), retrieval budget " + std::to_string(budget) + " page(s).");
+    // Over-subscribed for the requested concurrency: warn, do not refuse. Note that
+    // lanes * (sink + slack) > pool is also only a warning here, per the user's over-subscription rule;
+    // lanes will contend for the sink floor and the loser receives a clean per-request 429.
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        std::fprintf(stderr,
+                     "[ninfer] KVMem ring: per-lane demand (%u = sink %u + budget %u + slack %u) exceeds "
+                     "per-lane share (%u = pool %u / %u lane(s)) by %u page(s). Over-subscription is "
+                     "tolerated; a short request leaves share for other lanes. A prefix-adoption request "
+                     "that needs its whole range resident at once will fail cleanly per request.\n",
+                     lane_need, proto_kv_sink_pages(), budget, kRingSlackPages,
+                     lane_pool, pool, lanes, lane_need - lane_pool);
+    }
 }
 
 // LOCAL FIX (B01 ring room): this beat used to live inside ensure_sequence_kv_mapped as a local
@@ -2534,9 +2545,19 @@ void ProgramImpl::ensure_ring_room(KVAddressSpaceStore& addresses, LogicalKVPage
     // At one lane the two terms are the same number and this changes nothing: free_now is at most
     // pool - lane_resident, so free_now >= want_free already implies
     // lane_resident + need + wanted_extra <= pool - kRingSlackPages == the ceiling.
-    const std::uint32_t lane_pool = ring_lane_pool_pages(pages.physical_pool().usable_pages(),
-                                                         max_concurrency);
-    const std::uint32_t ceiling   = ring_lane_ceiling_pages(lane_pool);
+    // Dynamic ceiling: pool minus slack minus what OTHER lanes currently hold on the Device.
+    // A short request that holds few pages lets another lane grow into the remainder.
+    std::uint32_t other_lanes_resident = 0;
+    addresses.for_each_address([&](const KVAddressSpaceHandle& handle, bool /*active*/,
+                                  std::uint32_t mapped) {
+        if (handle == address) { return; }
+        for (std::uint32_t page = 0; page < mapped; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(handle, page);
+            if (pages.valid(logical) && pages.device_resident(logical)) { ++other_lanes_resident; }
+        }
+    });
+    const std::uint32_t ceiling   = ring_lane_dynamic_ceiling(pages.physical_pool().usable_pages(),
+                                                               other_lanes_resident);
     std::uint32_t lane_resident   = 0;
     for (std::uint32_t page = 0; page < mapped; ++page) {
         const LogicalKVPageHandle logical = addresses.logical_page(address, page);
