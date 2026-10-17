@@ -453,6 +453,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
                branch_one_tail != shared_tail && pages.address_references(shared_full) == 2 &&
                pages.address_references(shared_tail) == 1,
            "shared branch references full pages and publishes a private partial tail");
+    expect(!addresses.release_device_residency_hold(*shared, 0) &&
+               pages.active_address_references(shared_full) == 1 &&
+               pages.device_resident(shared_full),
+           "inactive shared source cannot release its active branch's Device residency hold");
     addresses.ensure_mapped_to_tokens(*branch_one, 66, device.stream);
     addresses.commit_frontier(*branch_one, 66);
     expect(pages.committed_columns(shared_tail) == 1 &&

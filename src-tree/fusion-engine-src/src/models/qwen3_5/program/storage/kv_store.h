@@ -971,6 +971,7 @@ public:
         : pages_(&pages), tables_(&tables), page_capacity_(page_capacity),
           addresses_(address_capacity), free_(address_capacity),
           memberships_(checked_membership_cells(address_capacity, page_capacity)),
+          residency_holds_(checked_membership_cells(address_capacity, page_capacity), 0U),
           free_count_(address_capacity) {
         if (address_capacity == 0 || page_capacity == 0 ||
             page_capacity != tables.logical_page_capacity()) {
@@ -1180,7 +1181,7 @@ public:
                 pages_->clear_protection(logical);
                 pages_->set_writer(logical, true);
             }
-            pages_->retain_active_reference(logical);
+            acquire_device_residency_hold(activation.address_, page);
         }
         if (activation.defer_missing_replicas_) {
             publish_membership_resident_runs(address, stream);
@@ -1201,7 +1202,7 @@ public:
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
             if (pages_->writer_references(logical) != 0) { pages_->set_writer(logical, false); }
-            pages_->release_active_reference(logical);
+            release_device_residency_hold(handle, page);
         }
         address.row.reset();
         address.reservation.release();
@@ -1380,7 +1381,7 @@ public:
         fork.row_.reset();
         destination.active = true;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
-            pages_->retain_active_reference(membership(destination, page));
+            acquire_device_residency_hold(fork.destination_, page);
         }
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             if (page == fork.full_pages_ && fork.tail_source_settled_) { continue; }
@@ -1535,7 +1536,7 @@ public:
         fork.row_.reset();
         destination.active = true;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
-            pages_->retain_active_reference(membership(destination, page));
+            acquire_device_residency_hold(fork.destination_, page);
         }
         for (const LogicalKVPageHandle logical : fork.full_pages_) {
             pages_->unpin_source(logical);
@@ -1733,9 +1734,8 @@ public:
         destination.row                = std::move(source.row);
         destination.active             = true;
 
-        if (snapshot.shape_.tail_columns != 0) {
-            pages_->release_active_reference(membership(source, snapshot.shape_.full_pages));
-            pages_->retain_active_reference(membership(destination, snapshot.shape_.full_pages));
+        for (std::uint32_t page = 0; page < required_pages; ++page) {
+            transfer_device_residency_hold(snapshot.source_, snapshot.destination_, page);
         }
 
         source.row.reset();
@@ -1816,7 +1816,7 @@ public:
         pages_->physical_pool().copy_from_host(
             source, std::span<const DeviceKVPageHandle>(&destination, 1), stream);
         pages_->publish_device_replica(logical);
-        pages_->retain_active_reference(logical);
+        acquire_device_residency_hold(handle, page);
         publish_scratch_.clear();
         // ADAPTATION (master API): the counterpart passes a tag here - physical(handle, "restore-src") -
         // but master's LogicalKVPageStore::physical takes only the handle (kv_store.h:432). Same value,
@@ -1863,8 +1863,10 @@ public:
             }
             throw;
         }
-        for (const LogicalKVPageHandle page : added) { pages_->retain_active_reference(page); }
         address.page_count = target;
+        for (std::uint32_t index = begin; index < target; ++index) {
+            acquire_device_residency_hold(handle, index);
+        }
     }
 
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
@@ -1917,7 +1919,7 @@ public:
             const std::uint32_t index  = --address.page_count;
             LogicalKVPageHandle page   = membership(address, index);
             membership(address, index) = {};
-            pages_->release_active_reference(page);
+            release_device_residency_hold(handle, index);
             pages_->dematerialize(page, address.reservation);
         }
         if (target != 0) {
@@ -2083,8 +2085,60 @@ public:
         return membership(address, logical_page);
     }
 
-    [[nodiscard]] bool has_active_reference(LogicalKVPageHandle page) const noexcept {
-        return pages_->valid(page) && pages_->active_address_references(page) != 0;
+    [[nodiscard]] bool has_device_residency_hold(KVAddressSpaceHandle handle,
+                                                  std::uint32_t logical_page) const noexcept {
+        if (!valid(handle)) { return false; }
+        const Address& address = addresses_[handle.index_];
+        return logical_page < address.page_count && residency_hold(address, logical_page) != 0;
+    }
+
+    [[nodiscard]] bool release_device_residency_hold(KVAddressSpaceHandle handle,
+                                                     std::uint32_t logical_page) {
+        Address& address = require(handle);
+        if (logical_page >= address.page_count || !residency_hold(address, logical_page)) {
+            return false;
+        }
+        const LogicalKVPageHandle logical = membership(address, logical_page);
+        residency_hold(address, logical_page) = false;
+        pages_->release_active_reference(logical);
+        return true;
+    }
+
+    void acquire_device_residency_hold(KVAddressSpaceHandle handle, std::uint32_t logical_page) {
+        Address& address = require_active(handle);
+        if (logical_page >= address.page_count) {
+            throw std::out_of_range("KV device residency hold is outside the address space");
+        }
+        if (residency_hold(address, logical_page)) { return; }
+        const LogicalKVPageHandle logical = membership(address, logical_page);
+        if (!pages_->device_resident(logical)) {
+            throw std::logic_error("KV device residency hold has no Device replica");
+        }
+        pages_->retain_active_reference(logical);
+        residency_hold(address, logical_page) = true;
+    }
+
+    void transfer_device_residency_hold(KVAddressSpaceHandle source_handle,
+                                        KVAddressSpaceHandle destination_handle,
+                                        std::uint32_t logical_page) {
+        Address& source      = require(source_handle);
+        Address& destination = require_active(destination_handle);
+        if (!source.active || logical_page >= source.page_count ||
+            logical_page >= destination.page_count) {
+            throw std::out_of_range("KV device residency transfer is outside the address space");
+        }
+        const LogicalKVPageHandle source_logical = membership(source, logical_page);
+        const LogicalKVPageHandle destination_logical = membership(destination, logical_page);
+        if (!residency_hold(source, logical_page) || residency_hold(destination, logical_page) ||
+            !pages_->device_resident(destination_logical)) {
+            throw std::logic_error("KV device residency transfer is invalid");
+        }
+        residency_hold(source, logical_page)      = false;
+        residency_hold(destination, logical_page) = true;
+        if (source_logical != destination_logical) {
+            pages_->release_active_reference(source_logical);
+            pages_->retain_active_reference(destination_logical);
+        }
     }
 
     [[nodiscard]] bool can_release(KVAddressSpaceHandle handle) const noexcept {
@@ -2125,6 +2179,7 @@ public:
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             if (!pages_->release_reference(membership(address, page), false)) { std::terminate(); }
             membership(address, page) = {};
+            residency_hold(address, page) = 0U;
         }
         const std::uint32_t index      = handle.index_;
         const std::uint32_t generation = next_generation(address.generation);
@@ -2243,6 +2298,17 @@ private:
         return memberships_[index * page_capacity_ + page];
     }
 
+    [[nodiscard]] std::uint8_t& residency_hold(Address& address, std::uint32_t page) noexcept {
+        const std::size_t index = static_cast<std::size_t>(&address - addresses_.data());
+        return residency_holds_[index * page_capacity_ + page];
+    }
+
+    [[nodiscard]] const std::uint8_t& residency_hold(const Address& address,
+                                                      std::uint32_t page) const noexcept {
+        const std::size_t index = static_cast<std::size_t>(&address - addresses_.data());
+        return residency_holds_[index * page_capacity_ + page];
+    }
+
     [[nodiscard]] const LogicalKVPageHandle& membership(const Address& address,
                                                         std::uint32_t page) const noexcept {
         const std::size_t index = static_cast<std::size_t>(&address - addresses_.data());
@@ -2290,6 +2356,7 @@ private:
     std::vector<Address> addresses_;
     std::vector<std::uint32_t> free_;
     std::vector<LogicalKVPageHandle> memberships_;
+    std::vector<std::uint8_t> residency_holds_;
     std::vector<DeviceKVPageHandle> publish_scratch_;
     std::uint32_t free_count_ = 0;
 };

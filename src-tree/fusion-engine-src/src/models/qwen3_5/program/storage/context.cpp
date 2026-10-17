@@ -1837,8 +1837,9 @@ std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& a
                                                           std::uint32_t target_free) {
     if (host_kv_extents == nullptr || target_free == 0) { return 0; }
     std::uint32_t freed = 0;
-    std::uint32_t slots_visited = 0, skip_invalid = 0, skip_noresident = 0, skip_pins = 0,
-                  skip_activation = 0, skip_stalehost = 0, skip_partial = 0, skip_duplicate = 0;
+    std::uint32_t slots_visited = 0, skip_invalid = 0, skip_noresident = 0, skip_active_hold = 0,
+                  skip_pins = 0, skip_activation = 0, skip_stalehost = 0, skip_partial = 0,
+                  skip_duplicate = 0;
     // LOCAL DIAGNOSTIC (demote-counters): the fourth way to end with freed=0 was invisible. A
     // refused host-arena reservation (HostKVExtentStore full) returns false from flush() without
     // bumping any counter -- and the tail call at the end of this function dropped the return
@@ -1869,7 +1870,6 @@ std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& a
             return false;
         }
         for (const LogicalKVPageHandle logical : batch) {
-            pages.release_active_reference(logical);
             if (!pages.drop_device_replica(logical)) { return false; }
         }
         freed += static_cast<std::uint32_t>(batch.size());
@@ -1884,6 +1884,13 @@ std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& a
             const LogicalKVPageHandle logical = addresses.logical_page(handle, page);
             if (!pages.valid(logical)) { ++skip_invalid; continue; }
             if (!pages.device_resident(logical)) { ++skip_noresident; continue; }
+            // An inactive alias owns no residency hold. A nonzero aggregate therefore belongs to an
+            // active sibling and forbids this alias from taking its shared Device replica.
+            if (addresses.has_device_residency_hold(handle, page) ||
+                pages.active_address_references(logical) != 0) {
+                ++skip_active_hold;
+                continue;
+            }
             if (pages.source_pins(logical) != 0) { ++skip_pins; continue; }
             // LOCAL FIX (2-lane pending activation, 2026-10-17): a page another lane's activation
             // has already charged to itself is NOT free cache, even though it is reachable through
@@ -1912,7 +1919,6 @@ std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& a
                 // Content already on the Host: just give up the Device replica.
                 if (!pages.host_replica_current(logical)) { ++skip_stalehost; continue; }
                 pages.set_writer(logical, false);
-                pages.release_active_reference(logical);
                 if (pages.drop_device_replica(logical)) { ++freed; }
                 continue;
             }
@@ -1944,11 +1950,11 @@ std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& a
     if (freed < target_free) {
         std::fprintf(stderr,
                      "[ninfer] demote-other short: freed=%u want=%u slots=%u invalid=%u "
-                     "noresident=%u pins=%u activation=%u stalehost=%u partial=%u dup=%u "
+                     "noresident=%u activehold=%u pins=%u activation=%u stalehost=%u partial=%u dup=%u "
                      "flushfail=%u declined=%u pending=%zu\n",
                      freed, target_free, slots_visited, skip_invalid, skip_noresident,
-                     skip_pins, skip_activation, skip_stalehost, skip_partial, skip_duplicate,
-                     flush_failed, flush_declined, batch.size());
+                     skip_active_hold, skip_pins, skip_activation, skip_stalehost, skip_partial,
+                     skip_duplicate, flush_failed, flush_declined, batch.size());
     }
     return freed;
 }
@@ -2011,8 +2017,8 @@ std::uint32_t ProgramImpl::demote_kv_pages_to_host(KVAddressSpaceStore& addresse
             pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reserved),
                                                device.stream);
             // LOCAL FIX (2026-10-02): a declined publish stops the demotion exactly like the `prepare`
-            // refusal above -- `break` skips `release_active_reference` below, so this page keeps its
-            // Device replica and its data. Never drop a replica that has no Host copy.
+            // refusal above -- `break` skips the address-owned residency-hold release below, so this
+            // page keeps its Device replica and its data. Never drop a replica that has no Host copy.
             if (!host_kv_extents->publish(std::move(*reserved))) {
                 // No counter here on purpose: this function has no summary line to carry it, and the
                 // store already named the page and the reason in its own `publish declined` line.
@@ -2023,8 +2029,13 @@ std::uint32_t ProgramImpl::demote_kv_pages_to_host(KVAddressSpaceStore& addresse
             if (!pages.host_replica_current(logical)) { continue; }
             pages.set_writer(logical, false);
         }
-        pages.release_active_reference(logical);
-        if (!pages.drop_device_replica(logical)) { continue; }
+        if (!addresses.release_device_residency_hold(address, current)) { continue; }
+        if (!pages.drop_device_replica(logical)) {
+            // A shared active sibling still owns this replica. This row remains mapped to the same
+            // physical page, so it must keep its own hold rather than silently surrender it.
+            addresses.acquire_device_residency_hold(address, current);
+            continue;
+        }
         ++demoted;
     }
     return demoted;
@@ -2556,15 +2567,24 @@ void ProgramImpl::ensure_ring_room(KVAddressSpaceStore& addresses, LogicalKVPage
     // At one lane the two terms are the same number and this changes nothing: free_now is at most
     // pool - lane_resident, so free_now >= want_free already implies
     // lane_resident + need + wanted_extra <= pool - kRingSlackPages == the ceiling.
-    // Dynamic ceiling: pool minus slack minus what OTHER lanes currently hold on the Device.
+    // Dynamic ceiling: pool minus slack minus UNIQUE physical replicas held by other lanes. An
+    // aliased retained-prefix page consumes one Device slot even when several addresses name it.
     // A short request that holds few pages lets another lane grow into the remainder.
     std::uint32_t other_lanes_resident = 0;
+    std::vector<LogicalKVPageHandle> other_lanes_seen;
+    other_lanes_seen.reserve(pages.physical_pool().usable_pages());
     addresses.for_each_address([&](const KVAddressSpaceHandle& handle, bool /*active*/,
                                   std::uint32_t mapped) {
         if (handle == address) { return; }
         for (std::uint32_t page = 0; page < mapped; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(handle, page);
-            if (pages.valid(logical) && pages.device_resident(logical)) { ++other_lanes_resident; }
+            if (!pages.valid(logical) || !pages.device_resident(logical) ||
+                std::find(other_lanes_seen.begin(), other_lanes_seen.end(), logical) !=
+                    other_lanes_seen.end()) {
+                continue;
+            }
+            other_lanes_seen.push_back(logical);
+            ++other_lanes_resident;
         }
     });
     const std::uint32_t ceiling   = ring_lane_dynamic_ceiling(pages.physical_pool().usable_pages(),
