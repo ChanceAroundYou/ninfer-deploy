@@ -11,3 +11,8 @@
 ### 诊断日志
 - `[ring] budgets: ... neighbor=%u ...` — 接缝补全 reach（`NINFER_KV_NEIGHBOR_PAGES`，默认 1）
 - `round_boundary chunk=%u round=%llu` — LRFU 检索轮边界（A1 实施后）
+
+### 生产决策（2026-10-17）
+- 保持 ring OFF / RETRIEVE=3072 / NEIGHBOR_PAGES=0
+- Max/LRFU/G3/G4 保持 gated OFF
+- 翻默认值条件：D4 验证通过（双稳态消除）+ A1/A2 读数干净
