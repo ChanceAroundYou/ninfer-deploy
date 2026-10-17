@@ -193,6 +193,53 @@ void test_kv_store(ninfer::DeviceContext& device) {
     store::HostKVExtentStore extents(host_arena, 8);
     store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
 
+    {
+        ninfer::HostKVArena empty_host_arena(0, host_layouts);
+        store::HostKVExtentStore empty_extents(empty_host_arena, 1);
+        const auto source = addresses.create_active(1, 0, {});
+        expect(source.has_value(), "Host prepare-refusal source allocation");
+        if (!source) { return; }
+        addresses.ensure_mapped_to_tokens(*source, 64, device.stream);
+        device.synchronize();
+        addresses.commit_frontier(*source, 64);
+        addresses.deactivate(*source);
+        const std::array source_page{addresses.logical_page(*source, 0)};
+        const auto refused = empty_extents.prepare(pages, source_page);
+        expect(!refused && pages.device_resident(source_page[0]) &&
+                   !pages.host_resident(source_page[0]) && pages.source_pins(source_page[0]) == 0 &&
+                   empty_host_arena.occupied_bytes() == 0 && empty_extents.occupied() == 0,
+               "Host prepare refusal preserves the Device-only source without pins or allocations");
+        expect(addresses.release(*source) && pages.occupied() == 0 &&
+                   physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0,
+               "Host prepare-refusal source releases without leaked ownership");
+    }
+
+    {
+        const auto source = addresses.create_active(1, 0, {});
+        expect(source.has_value(), "Host publish-refusal source allocation");
+        if (!source) { return; }
+        addresses.ensure_mapped_to_tokens(*source, 64, device.stream);
+        device.synchronize();
+        addresses.commit_frontier(*source, 64);
+        addresses.deactivate(*source);
+        const std::array source_page{addresses.logical_page(*source, 0)};
+        auto first  = extents.prepare(pages, source_page);
+        auto second = extents.prepare(pages, source_page);
+        expect(first.has_value() && second.has_value() && pages.source_pins(source_page[0]) == 2,
+               "concurrent Host reservations pin the same Device source independently");
+        const auto published = second ? extents.publish(std::move(*second)) : std::nullopt;
+        const auto declined  = first ? extents.publish(std::move(*first)) : std::nullopt;
+        expect(published.has_value() && !declined && pages.device_resident(source_page[0]) &&
+                   pages.host_resident(source_page[0]) && pages.host_replica_current(source_page[0]) &&
+                   pages.source_pins(source_page[0]) == 0 &&
+                   host_arena.occupied_bytes() == host_layout.page_stride && extents.occupied() == 1,
+               "Host publish refusal leaves the published replica and source ownership intact");
+        expect(extents.release(*published) && addresses.release(*source) && pages.occupied() == 0 &&
+                   physical_pages.allocated_pages() == 0 && physical_pages.reserved_pages() == 0 &&
+                   host_arena.occupied_bytes() == 0,
+               "Host publish-refusal fixture returns its extent and source resources");
+    }
+
     const auto address = addresses.create_active(3, 0, {});
     expect(address.has_value(), "active KV address allocation");
     addresses.ensure_mapped_to_tokens(*address, 65, device.stream);
@@ -707,6 +754,42 @@ void test_pending_activation_holds_device_replicas(ninfer::DeviceContext& device
     }
     expect(pages.can_drop_device_replica(membership[1]),
            "destroying an uncommitted KV activation releases its hold");
+
+    std::optional<store::KVAddressSpaceHandle> replacement;
+    std::optional<store::KVActivationReservation> replacement_activation;
+    {
+        auto stale_activation = addresses.prepare_activation(*reusable, 3, 1, 129);
+        expect(!pages.can_drop_device_replica(membership[0]),
+               "pending activation pins remain before its inactive address is released");
+        expect(addresses.release(*reusable) && extents.release_unreferenced() == 3U * host_layout.page_stride &&
+                   pages.occupied() == 0 && host_arena.occupied_bytes() == 0,
+               "releasing a pending activation source reclaims stale logical and Host ownership");
+
+        replacement = addresses.create_active(3, 0, {});
+        expect(replacement.has_value(), "released pending activation address slot is reusable");
+        if (!replacement) { return; }
+        addresses.ensure_mapped_to_tokens(*replacement, 64, device.stream);
+        device.synchronize();
+        addresses.commit_frontier(*replacement, 64);
+        addresses.deactivate(*replacement);
+        replacement_activation.emplace(addresses.prepare_activation(*replacement, 3, 0, 64));
+        expect(pages.activation_pins(addresses.logical_page(*replacement, 0)) == 1,
+               "replacement activation owns a distinct pin before stale abort");
+    }
+
+    expect(replacement.has_value() &&
+               pages.activation_pins(addresses.logical_page(*replacement, 0)) == 1,
+           "destroying a stale activation reservation cannot unpin the replacement page");
+    replacement_activation.reset();
+    expect(pages.activation_pins(addresses.logical_page(*replacement, 0)) == 0,
+           "replacement activation releases its own pin after stale abort");
+    expect(addresses.release(*replacement), "replacement address releases after stale activation abort");
+    const auto row_reused = addresses.create_active(3, 1, {});
+    expect(row_reused.has_value(), "stale activation abort returns its execution-row lease");
+    if (row_reused) {
+        addresses.deactivate(*row_reused);
+        expect(addresses.release(*row_reused), "reused execution-row address releases");
+    }
 }
 
 // Engine recovery rebuilds the context stores when a failed owner release leaves objects behind.
