@@ -45,7 +45,11 @@
 
 原设计（按分数门控接缝补全 + G4 信号替换）建立在「宽度/完整度权衡」前提上，已被证伪。新设计：
 
-### D1 闭环解耦（核心）
+### D1 闭环解耦（核心） — 已满足
+
+> 代码层：select_retrieval_pages 已使用固定 256-token 滑动窗口（context.cpp:1784 `kQueryWindow=256`），
+> query 不依赖 kept 集。kept 集仅影响 ring preferred（恢复集），不反向影响 query。
+> 因此 D1 在当前代码中已成立，无需改动。
 - **问题**：scorer 的 query 窗口 = 上一轮 kept 集；kept 集 = 排序器输出。这是正反馈。
 - **方案**：把 query 窗口改为**固定滑动窗口**（最近 N token，N=KV_RETRIEVE 的 1/4），不随 kept 集变化；kept 集只影响候选集，不反向影响 query。这样 B/R/排序轴可独立评估。
 - **代码**：`context.cpp` select_retrieval_pages 入口，query 构造处（`q` 的来源）改为固定窗口；原逻辑保留为 `NINFER_KV_QUERY_MODE=kept` 开关（默认 fixed）。
