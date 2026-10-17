@@ -2562,8 +2562,6 @@ void ProgramImpl::ensure_ring_room(KVAddressSpaceStore& addresses, LogicalKVPage
             ++wanted_extra;   // a preferred page has to be brought back
         }
     }
-    const std::uint32_t want_free   = need + kRingSlackPages + wanted_extra;
-    const std::uint32_t free_now    = free_pages(pages);
     // ---- LOCAL (ring lanes, 2026-10-17): THIS LANE'S OWN CEILING, the second way the pool can be
     // short. -----------------------------------------------------------------------------------------
     // The free-page target below is a GLOBAL quantity, and the only pages a lane may reclaim are its
@@ -2595,17 +2593,22 @@ void ProgramImpl::ensure_ring_room(KVAddressSpaceStore& addresses, LogicalKVPage
             ++other_lanes_resident;
         }
     });
-    const std::uint32_t ceiling   = ring_lane_dynamic_ceiling(pages.physical_pool().usable_pages(),
-                                                               other_lanes_resident);
-    std::uint32_t lane_resident   = 0;
+    std::uint32_t lane_resident = 0;
     for (std::uint32_t page = 0; page < mapped; ++page) {
         const LogicalKVPageHandle logical = addresses.logical_page(address, page);
         if (pages.valid(logical) && pages.device_resident(logical)) { ++lane_resident; }
     }
-    const std::uint32_t projected  = lane_resident + need + wanted_extra;
-    const std::uint32_t over_share = projected > ceiling ? projected - ceiling : 0U;
-    const std::uint32_t target_free =
-        std::max(want_free > free_now ? want_free - free_now : 0U, over_share);
+    const RingCapacityProjection projection = project_ring_capacity({
+        .pool_pages           = pages.physical_pool().usable_pages(),
+        .allocated_pages      = pages.physical_pool().allocated_pages(),
+        .lane_resident_pages  = lane_resident,
+        .other_resident_pages = other_lanes_resident,
+        .required_pages       = need,
+        .preferred_restores   = wanted_extra,
+    });
+    const std::uint32_t want_free   = need + kRingSlackPages + wanted_extra;
+    const std::uint32_t free_now    = projection.free_pages;
+    const std::uint32_t target_free = projection.target_free_pages;
     if (target_free == 0) {
         (void)demote_kv_pages_to_host(addresses, pages, address, sink_pages, 0U, preferred);
         return;
@@ -2615,8 +2618,8 @@ void ProgramImpl::ensure_ring_room(KVAddressSpaceStore& addresses, LogicalKVPage
     const std::uint32_t freed_cold =
         demote_other_addresses_to_host(addresses, pages, address, target_free);
     const std::uint32_t free_after = free_pages(pages);
-    const std::uint32_t target2 =
-        std::max(want_free > free_after ? want_free - free_after : 0U, over_share);
+    const std::uint32_t target2 = std::max(
+        want_free > free_after ? want_free - free_after : 0U, projection.share_shortfall);
     const std::uint32_t freed_own =
         demote_kv_pages_to_host(addresses, pages, address, sink_pages, target2, preferred);
     // LOCAL FIX (B01 ring early verdict): both demotions used to have their return value dropped, so

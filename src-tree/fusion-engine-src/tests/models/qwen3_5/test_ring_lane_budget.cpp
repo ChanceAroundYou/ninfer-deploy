@@ -23,5 +23,30 @@ int main() {
     // A lane holding few pages lets another grow: 128 pool, other holds 10 -> ceiling 110.
     assert(ring_lane_dynamic_ceiling(128, 10) == 110);
 
+    const RingCapacityProjection reclaim_required = project_ring_capacity({
+        .pool_pages           = 16,
+        .allocated_pages      = 16,
+        .lane_resident_pages  = 8,
+        .other_resident_pages = 4,
+        .required_pages       = 1,
+        .preferred_restores   = 2,
+    });
+    assert(reclaim_required.free_pages == 0 && reclaim_required.ceiling_pages == 4 &&
+           reclaim_required.projected_pages == 11 && reclaim_required.target_free_pages == 11 &&
+           reclaim_required.status_after(0) == RingCapacityStatus::InsufficientDevicePages &&
+           reclaim_required.status_after(1) == RingCapacityStatus::Ready);
+
+    const RingCapacityProjection already_ready = project_ring_capacity({
+        .pool_pages           = 16,
+        .allocated_pages      = 12,
+        .lane_resident_pages  = 4,
+        .other_resident_pages = 2,
+        .required_pages       = 1,
+        .preferred_restores   = 0,
+    });
+    assert(already_ready.free_pages == 4 && already_ready.ceiling_pages == 6 &&
+           already_ready.projected_pages == 5 && already_ready.target_free_pages == 0 &&
+           already_ready.status_after(1) == RingCapacityStatus::Ready);
+
     return 0;
 }
