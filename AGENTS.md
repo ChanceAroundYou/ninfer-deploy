@@ -13,20 +13,20 @@
   - 策略层：改造 `kvmem/kvmem-qw3`（Di Chai，Apache-2.0，8 件 PORTED 文件在 `src/ops/kvmem/qw3/`）
   - 定池语义：参照 CraneBW/laamaafung（仅语义，未并入代码）
   - 本 fork 目标：**sm_86 / NVIDIA GeForce RTX 3090 (24 GB)**，CUDA 12.8，版本 `0.11.0-rtx3090`
-  - 上游目标 sm_120a/RTX 5090 的调参常量不是本机权威，必须在本卡实测
+  - 上游目标 sm_120a/RTX 5090 的调参常量不是本卡权威，必须在本卡实测
 - **本仓库** `ninfer-deploy`：部署源码树的版本化真相源。含 NInfer/KVMem 源码、WebUI、部署定义、文档。
   - **不含**：模型、构建目录、venv、下载暂存、日志、凭证、benchmark 输出
 - **许可证**：Apache-2.0（引擎 + vendored 三方库各自 MIT/Apache/BSD，见 README.md 底部署名）
 
 ---
 
-## 1. 本机与远程
+## 1. 两台设备
 
-### 本机
-- 本机负责编排、源码管理与文档编辑；GPU 推理与 CUDA 构建统一在远程 AI 服务器执行。
-- 通过 `ssh ai` 连接远程 AI 服务器（别名 `ai`，SSH config 已配置）。
+### 设备 A（开发机）
+- 负责编排、源码管理与文档编辑；GPU 推理与 CUDA 构建可在开发机执行，也可通过 `ssh ai` 在设备 B 执行。
+- 开发也可能直接在设备 B 上进行；两种方式均合法，以实际环境为准。
 
-### 远程 AI 服务器（`ssh ai`）
+### 设备 B（AI 服务器，`ssh ai`）
 - 用户：`chenran`，主目录 `/home/ET/chenran/`
 - **主目录**：`~/ninfer-deploy/`（源码 + 构建 + 脚本 + 模型 + 运行时）
   - 旧名 `kvmem-g3g4` 已重命名为 `ninfer-deploy`（两侧同名）
@@ -41,8 +41,8 @@
 
 ### 访问方式
 ```bash
-ssh ai                                    # 进入远程
-# 远程上：
+ssh ai                                    # 进入设备 B
+# 设备 B 上：
 cd ~/ninfer-deploy                        # 源码/构建/脚本主目录
 nvidia-smi                                # 查 GPU 占用
 ss -ltn | grep 18492                      # 查测试端口
@@ -53,7 +53,7 @@ ss -ltn | grep 18492                      # 查测试端口
 ## 2. 目录结构
 
 ```
-ninfer-deploy/                          # 本机仓库 = 远程主目录（两侧同名）
+ninfer-deploy/                          # 仓库根目录（两侧同名）
 ├── AGENTS.md                           # 本文件（AI 自动读取）
 ├── README.md                           # 人读简版 + 许可署名
 ├── src-tree/fusion-engine-src/         # NInfer/KVMem 源码与测试
@@ -70,7 +70,7 @@ ninfer-deploy/                          # 本机仓库 = 远程主目录（两�
 └── LICENSE                             # Apache-2.0
 ```
 
-远程 `~/ninfer-deploy/` 额外包含（不入 Git）：`build/`、`models/`、`runtime/`、`staging/`、`logs/`、`.env`、`qdl.env`。
+设备 B 的 `~/ninfer-deploy/` 额外包含（不入 Git）：`build/`、`models/`、`runtime/`、`staging/`、`logs/`、`.env`、`qdl.env`。
 
 ---
 
@@ -78,9 +78,9 @@ ninfer-deploy/                          # 本机仓库 = 远程主目录（两�
 
 ### 构建
 ```bash
-# 本机修改后同步到远程
+# 开发机修改后同步到设备 B
 rsync -a --exclude='build*/' --exclude='.git/' src-tree/fusion-engine-src/ ai:/home/ET/chenran/ninfer-deploy/fusion-engine-src/
-# 远程构建
+# 设备 B 构建
 ssh ai "cd ~/ninfer-deploy/build && /home/ET/zhanghao/anaconda3/envs/nus/bin/ninja <target>"
 ```
 - **ninja**：`/home/ET/zhanghao/anaconda3/envs/nus/bin/ninja`
