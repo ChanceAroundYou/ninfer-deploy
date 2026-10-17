@@ -63,11 +63,9 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
             tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
             invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
             partial_l_ptr,
-            // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): pass the retrieval bitmap the
-            // caller already carries (CausalSmallTInvocation.selected_blocks, launch.h:81); nullptr
-            // keeps the dense behaviour bit-for-bit.
-            invocation.selected_blocks != nullptr ? invocation.selected_blocks
-                                                 : proto_selected_blocks());
+            // LOCAL FIX (per-row ring mask, 2026-10-17): pass the bitmap off the view the kernel
+            // already receives; nullptr keeps the dense behaviour bit-for-bit.
+            cache.selected_blocks, cache.selection_row_words);
         CUDA_CHECK(cudaGetLastError());
     };
 
@@ -202,10 +200,6 @@ void causal_attention_small_t_k8v4_launch(
         .column_begin  = column_begin,
         .width         = width,
         .batch_size    = q.ne[3],
-        // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): carry the retrieval bitmap into the
-        // kernel. Same expression as the fp8 route; nullptr keeps the dense path bit-for-bit.
-        .selected_blocks =
-            cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
     };
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_k8v4_launch_for<CausalD256H24Kv4>(
@@ -232,11 +226,6 @@ void causal_attention_cached_small_t_k8v4_launch(const Tensor& q, const Tensor& 
         .column_begin  = 0,
         .width         = q.ne[2],
         .batch_size    = 1,
-        // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): the cached/decode route reads the
-        // bitmap straight off the layer view, because single_row_paged_kv_batch_view() drops the
-        // field when it builds the single-row view (core/paged_kv_cache.cpp:59-70).
-        .selected_blocks =
-            cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
     };
     PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {

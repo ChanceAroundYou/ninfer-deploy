@@ -632,6 +632,80 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "staged retained fork closes Device and Host ownership without leaks");
 }
 
+// A pending activation is charged with the Device replicas its commit precondition needs
+// (`commit_activation` requires every mapped page in [0, page_count) to be Device-resident). The
+// address it activates is a catalogued continuation, so no active reference, writer reference or
+// source pin stands on those pages: to the ring's demotion they are pure cache. Measured 2026-10-17
+// at --max-concurrency 2, the second lane's decode step demoted the four pages the first lane had
+// just restored out of its checkpoint, the commit refused the activation, and the transaction's
+// abort then released the address underneath its own staging -- std::terminate, engine death.
+void test_pending_activation_holds_device_replicas(ninfer::DeviceContext& device) {
+    ninfer::LayoutBuilder builder;
+    ninfer::DeviceKVPagePoolSpec page_spec{
+        .page_group_count = 8,
+        .geometry =
+            {
+                .page_tokens        = static_cast<std::uint32_t>(ninfer::kPagedKVPageSize),
+                .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+                .planes = {{.dtype = ninfer::DType::BF16, .leading_extent = 8, .head_extent = 2}},
+            },
+    };
+    const ninfer::DeviceKVPagePoolLayout page_layout =
+        ninfer::plan_device_kv_page_pool(builder, page_spec);
+    const ninfer::KVExecutionTableLayout table_layout =
+        ninfer::plan_kv_execution_tables(builder, {.logical_page_capacity = 4, .table_rows = 2});
+    ninfer::DeviceArena arena(builder.finish(256));
+    const ninfer::DeviceSpan backing{arena.base(), arena.capacity()};
+    ninfer::DeviceKVPagePool physical_pages(backing, page_layout);
+    ninfer::KVExecutionTablePool physical_tables(backing, table_layout, physical_pages);
+    const ninfer::HostKVPageLayout host_layout =
+        ninfer::plan_host_kv_page_layout(physical_pages.geometry());
+    const std::array host_layouts{host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 8, host_layouts);
+    store::LogicalKVPageStore pages(physical_pages, physical_pages.capacity_pages() + 8U);
+    store::HostKVExtentStore extents(host_arena, 8);
+    store::KVAddressSpaceStore addresses(pages, physical_tables, 4, 4);
+
+    const auto reusable = addresses.create_active(3, 0, {});
+    expect(reusable.has_value(), "pending-activation address allocation");
+    if (!reusable) { return; }
+    addresses.ensure_mapped_to_tokens(*reusable, 129, device.stream);
+    device.synchronize();
+    addresses.commit_frontier(*reusable, 129);
+    addresses.deactivate(*reusable);
+    const std::array membership{addresses.logical_page(*reusable, 0),
+                                addresses.logical_page(*reusable, 1),
+                                addresses.logical_page(*reusable, 2)};
+    auto backup = extents.prepare(pages, membership);
+    expect(backup.has_value(), "pending-activation Host extent reservation");
+    if (!backup) { return; }
+    physical_pages.copy_to_host(extents.device_sources(*backup), extents.writable_view(*backup),
+                                device.transfer_stream);
+    CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+    (void)extents.publish(std::move(*backup));
+    expect(pages.can_drop_device_replica(membership[0]) &&
+               pages.can_drop_device_replica(membership[2]),
+           "a catalogued KV page with a current Host replica is demotable to begin with");
+
+    auto activation = addresses.prepare_activation(*reusable, 3, 1, 129);
+    expect(!pages.can_drop_device_replica(membership[0]) &&
+               !pages.can_drop_device_replica(membership[2]) &&
+               !pages.drop_device_replica(membership[1]),
+           "a pending KV activation holds the Device replicas its commit requires");
+    addresses.commit_activation(std::move(activation), device.stream);
+    addresses.deactivate(*reusable);
+    expect(pages.can_drop_device_replica(membership[0]),
+           "committing a KV activation releases its hold on the Device replicas");
+
+    {
+        auto abandoned = addresses.prepare_activation(*reusable, 3, 1, 129);
+        expect(!pages.can_drop_device_replica(membership[1]),
+               "an abandoned KV activation holds its Device replicas until it is destroyed");
+    }
+    expect(pages.can_drop_device_replica(membership[1]),
+           "destroying an uncommitted KV activation releases its hold");
+}
+
 // Engine recovery rebuilds the context stores when a failed owner release leaves objects behind.
 // That is only sound if abandoning a store with live objects returns every Device page, growth
 // reservation, execution row and Host KV allocation to its pool.
@@ -744,6 +818,7 @@ int main() {
         ninfer::DeviceContext device(0);
         test_state_store(device);
         test_kv_store(device);
+        test_pending_activation_holds_device_replicas(device);
         test_abandoned_stores_return_resources(device);
         device.synchronize();
     } catch (const std::exception& error) {

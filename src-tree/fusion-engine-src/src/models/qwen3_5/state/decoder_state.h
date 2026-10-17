@@ -95,13 +95,26 @@ public:
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
     // The rank holding this layer's KV planes, which is also the rank whose block table it reads.
     [[nodiscard]] std::size_t layer_rank(std::uint32_t layer) const;
-    // LOCAL PROTOTYPE (KVMem-style ring): per-request retrieval mask over 64-token KV pages, carried
-    // into every layer view the attention ops consume. nullptr (the default) selects every page,
-    // which reproduces the original dense behaviour bit-for-bit. The retrieval policy installs it
-    // once per request; the device bitmap must outlive the attention calls that read it.
-    void install_selection(std::span<const std::uint32_t> words);
+    // LOCAL PROTOTYPE (KVMem-style ring): the retrieval mask over 64-token KV pages, carried into
+    // every layer view the attention ops consume. nullptr (the default) selects every page, which
+    // reproduces the original dense behaviour bit-for-bit. The retrieval policy installs it once per
+    // request; the device bitmaps must outlive the attention calls that read them.
+    //
+    // One bitmap per execution-table row. Sequences sharing this cache have their own logical-to-
+    // physical mappings and therefore their own resident sets, so a single shared bitmap would let
+    // whichever sequence installed last decide which pages every sequence attends. `row` is the
+    // execution-table row -- the same index the attention kernels resolve for the block table -- and a
+    // row that never installs anything keeps the all-selected default.
+    //
+    // `words` covers pages [0, 32 * words.size()). Pages past that stay selected: the sequence is
+    // still writing into them, so masking them would hide the chunk being built. A mask longer than
+    // one row is rejected rather than truncated, because overrunning its row would silently select
+    // pages for the next sequence.
+    void install_selection(std::int32_t row, std::span<const std::uint32_t> words);
 
-    void clear_selection() noexcept { selected_blocks_ = nullptr; }
+    // Words per row in the buffer `batch_layer_view()` publishes as `selected_blocks`; 0 when the
+    // pool covers the logical capacity and no mask is carried at all.
+    [[nodiscard]] std::int32_t selection_row_words() const noexcept { return selection_row_words_; }
 
 private:
     friend class PagedKVCacheView;
@@ -115,9 +128,14 @@ private:
     std::int32_t kv_heads_     = 0;
     std::int32_t head_dim_     = 0;
     KvCacheStorage storage_    = KvCacheStorage::BFloat16;
-    const std::uint32_t* selected_blocks_ = nullptr;
-    std::uint32_t* selection_device_      = nullptr;
-    std::size_t selection_words_          = 0;
+    // One `selection_rows_ * selection_row_words_` device buffer, row-major, every row all-selected at
+    // first. Allocated once in the constructor and never resized: CUDA Graph capture bakes the pointer
+    // into kernel arguments, so it has to stay put. `selection_row_host_` composes one row before it is
+    // uploaded, which is what keeps a short mask from disturbing its neighbours.
+    std::uint32_t* selection_device_  = nullptr;
+    std::int32_t selection_rows_      = 0;
+    std::int32_t selection_row_words_ = 0;
+    std::vector<std::uint32_t> selection_row_host_;
 };
 
 struct DecoderStateLayout {

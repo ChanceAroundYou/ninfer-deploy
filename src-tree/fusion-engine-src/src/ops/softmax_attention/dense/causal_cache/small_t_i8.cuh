@@ -68,10 +68,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
         float scale, float* partial_acc, float* partial_m, float* partial_l,
         // LOCAL FIX (ring mask on the int8 family decode route, 2026-10-02): the retrieval bitmap.
-        // nullptr = dense (bit-identical to before); passed from invocation.selected_blocks by
+        // nullptr = dense (bit-identical to before); read off the batch view by
         // small_t_i8_launch.cuh, so the public launcher signature and all 28 explicit instantiations
         // stay untouched.
-        const std::uint32_t* selected_blocks) {
+        const std::uint32_t* selected_blocks, std::int32_t selection_row_words) {
     constexpr bool PackedKeys          = Keys != KvKeyCoding::Int8;
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -170,6 +170,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    // LOCAL FIX (per-row ring mask, 2026-10-17): the mask belongs to the SEQUENCE, and the sequence
+    // is named by `table_row`, not by the batch slot. Every batch used to read one shared bitmap, so
+    // whichever sequence installed last decided which pages all of them attended.
+    const std::uint32_t* selection =
+        paged_kv_selection(selected_blocks, table_row, selection_row_words);
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
                        TokenTile * split_count;
@@ -765,9 +770,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             // rk2v4-e8 (small_t.cu:403, kv_cache_is_int8_family), so one edit covers the family. A page
             // the ring demoted has had its device slot recycled, so its K/V must not be read.
             const auto block_selected = [&](int key) {
-                if (selected_blocks == nullptr) { return true; }
+                if (selection == nullptr) { return true; }
                 const int page = key >> kPagedKVPageShift;
-                return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+                return ((selection[page >> 5] >> (page & 31)) & 1U) != 0U;
             };
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll

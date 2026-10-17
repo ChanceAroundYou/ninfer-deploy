@@ -261,7 +261,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         // handed to another page, so "fully inside the causal window" no longer implies "safe to
         // read". Same shape as prompt_fp8.cuh:266-292 (bf16 was the CLI default dtype, so this is the
         // route a hand-written command line lands on when --kv-dtype is omitted).
-        const bool selection_active = metadata.selected_blocks != nullptr;
+        const bool selection_active = metadata.selection() != nullptr;
 
         // block row-max on raw (unscaled) scores; scale is folded into exp2 below
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
@@ -278,22 +278,22 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
                 const int key1 = key0 + 1;
                 score[nt][0] =
                     (qrow0 < tokens && key0 <= qabs0 &&
-                     paged_kv_block_selected(metadata.selected_blocks, key0))
+                     paged_kv_block_selected(metadata.selection(), key0))
                         ? score[nt][0]
                         : -CUDART_INF_F;
                 score[nt][1] =
                     (qrow0 < tokens && key1 <= qabs0 &&
-                     paged_kv_block_selected(metadata.selected_blocks, key1))
+                     paged_kv_block_selected(metadata.selection(), key1))
                         ? score[nt][1]
                         : -CUDART_INF_F;
                 score[nt][2] =
                     (qrow1 < tokens && key0 <= qabs1 &&
-                     paged_kv_block_selected(metadata.selected_blocks, key0))
+                     paged_kv_block_selected(metadata.selection(), key0))
                         ? score[nt][2]
                         : -CUDART_INF_F;
                 score[nt][3] =
                     (qrow1 < tokens && key1 <= qabs1 &&
-                     paged_kv_block_selected(metadata.selected_blocks, key1))
+                     paged_kv_block_selected(metadata.selection(), key1))
                         ? score[nt][3]
                         : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

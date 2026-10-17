@@ -61,8 +61,7 @@ void causal_attention_prompt_fp8_attention_launch(const Tensor& q, const Tensor&
                                                   float scale, const PagedKVLayerView& cache,
                                                   Tensor& out, cudaStream_t stream) {
     const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data),
-                                         cache.selected_blocks != nullptr ? cache.selected_blocks
-                                                                          : proto_selected_blocks()};
+                                         cache.selected_blocks};
     causal_attention_prompt_fp8_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                    stream);
 }
@@ -79,9 +78,9 @@ void causal_attention_prompt_fp8_launch(const Tensor& q, const Tensor& k, const 
             .valid_columns =
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows      = static_cast<const std::int32_t*>(table_rows.data),
-            .table_stride    = cache.block_tables.ne[0],
-            .selected_blocks = cache.selected_blocks != nullptr ? cache.selected_blocks
-                                                                : proto_selected_blocks(),
+            .table_stride = cache.block_tables.ne[0],
+            .selected_blocks     = cache.selected_blocks,
+            .selection_row_words = cache.selection_row_words,
         };
         causal_attention_prompt_fp8_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                        stream);

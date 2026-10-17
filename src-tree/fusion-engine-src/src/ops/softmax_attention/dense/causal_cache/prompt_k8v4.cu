@@ -63,11 +63,10 @@ void causal_attention_prompt_k8v4_attention_launch(const Tensor& q, const Tensor
     // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): the k8v4 kernels never read the
     // selection bitmap, so a page the ring demoted to host was still read through the block table --
     // and because the freed Device slot is handed to the next new page, the demoted position was
-    // attended with ANOTHER page's K/V. Same expression as the fp8 route (prompt_fp8.cu:83-84):
-    // the per-request bitmap the ring installed, else the env prototype mask, else nullptr = dense.
+    // attended with ANOTHER page's K/V. The bitmap is the one the single row this launch reads
+    // installed; nullptr means dense.
     const PagedKVDirectMetadata metadata{
-        static_cast<const std::int32_t*>(cache.block_table.data),
-        cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks()};
+        static_cast<const std::int32_t*>(cache.block_table.data), cache.selected_blocks};
     causal_attention_prompt_k8v4_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                     stream);
 }
@@ -86,8 +85,8 @@ void causal_attention_prompt_k8v4_launch(const Tensor& q, const Tensor& k, const
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
             // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): see the direct-route comment above.
-            .selected_blocks =
-                cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
+            .selected_blocks     = cache.selected_blocks,
+            .selection_row_words = cache.selection_row_words,
         };
         causal_attention_prompt_k8v4_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                         stream);

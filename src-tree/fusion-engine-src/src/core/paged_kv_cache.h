@@ -18,6 +18,18 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+// Device pages the KVMem ring keeps free per lane. The restore path needs a free Device page to
+// work with, so a lane's resident footprint is capped below its share rather than at it. One home
+// for the number because the startup feasibility check and the runtime demotion target have to
+// agree: a check that admits a configuration the runtime then cannot hold is worse than no check.
+inline constexpr std::uint32_t kRingSlackPages = 8U;
+
+// Words in one sequence's retrieval bitmap: bit p of word (p >> 5) says whether the 64-token KV
+// page p is attended. One execution-table row owns one such bitmap.
+[[nodiscard]] constexpr std::uint32_t kv_selection_words(std::uint32_t pages) noexcept {
+    return (pages + 31U) / 32U;
+}
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -28,9 +40,11 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
-    // LOCAL PROTOTYPE: per-request retrieval mask over 64-token KV pages. Bit p of word
-    // (p >> 5) set means page p is attended; nullptr selects every page (dense, the original
-    // behaviour). Produced by the retrieval policy and carried to the attention kernels.
+    // LOCAL PROTOTYPE (KVMem-style ring): this sequence's retrieval mask over 64-token KV pages.
+    // Bit p of word (p >> 5) set means page p is attended; nullptr selects every page (dense, the
+    // original behaviour). Produced by the retrieval policy and carried to the attention kernels.
+    // This is the OWNING row's own bitmap, so a single-sequence route indexes it directly and needs
+    // no row stride -- a batched route reads the buffer base instead, see below.
     const std::uint32_t* selected_blocks = nullptr;
 };
 
@@ -44,10 +58,19 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
-    // LOCAL PROTOTYPE: per-request retrieval mask over 64-token KV pages. Bit p of word
-    // (p >> 5) set means page p is attended; nullptr selects every page (dense, the original
-    // behaviour). Produced by the retrieval policy and carried to the attention kernels.
+    // LOCAL PROTOTYPE (KVMem-style ring): the retrieval mask of EVERY row, laid out row-major as
+    // `execution_tables().row_count()` consecutive bitmaps of `selection_row_words` words. Bit p of
+    // word (p >> 5) of a row set means page p is attended for THAT row; nullptr selects every page
+    // (dense, the original behaviour).
+    //
+    // Several sequences share one cache and one Device page pool, but each one's logical-to-physical
+    // mapping is its own, so each one's resident set is its own: a single shared bitmap would let the
+    // last installer decide which pages every sequence attends. A kernel therefore reaches its own
+    // row's bitmap by adding `table_row * selection_row_words` to this base. `selection_row_words`
+    // cannot be derived in the kernel -- the small-T kernels' `logical_capacity` counts TOKENS, not
+    // pages -- so it is passed alongside.
     const std::uint32_t* selected_blocks = nullptr;
+    std::int32_t selection_row_words     = 0;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */

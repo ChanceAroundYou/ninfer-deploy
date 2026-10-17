@@ -23,9 +23,9 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     float* partial_acc, float* partial_m, float* partial_l,
-    // LOCAL FIX (ring mask on the bf16 decode route, 2026-10-02): the retrieval bitmap, passed from
-    // invocation.selected_blocks by small_t.cu. nullptr = dense, bit-identical to before.
-    const std::uint32_t* selected_blocks) {
+    // LOCAL FIX (ring mask on the bf16 decode route, 2026-10-02): the retrieval bitmap, read off the
+    // batch view by small_t.cu. nullptr = dense, bit-identical to before.
+    const std::uint32_t* selected_blocks, std::int32_t selection_row_words) {
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -78,6 +78,11 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    // LOCAL FIX (per-row ring mask, 2026-10-17): the mask belongs to the SEQUENCE, and the sequence
+    // is named by `table_row`, not by the batch slot. Every batch used to read one shared bitmap, so
+    // whichever sequence installed last decided which pages all of them attended.
+    const std::uint32_t* selection =
+        paged_kv_selection(selected_blocks, table_row, selection_row_words);
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
                        tokens * split_count;
@@ -295,9 +300,9 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         // LOCAL FIX (ring mask on the bf16 decode route, 2026-10-02): same lambda as
         // small_t_fp8.cuh:409-415 / small_t_k8v4.cuh. bf16 is the CLI default dtype.
         const auto block_selected = [&](int key) {
-            if (selected_blocks == nullptr) { return true; }
+            if (selection == nullptr) { return true; }
             const int page = key >> kPagedKVPageShift;
-            return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+            return ((selection[page >> 5] >> (page & 31)) & 1U) != 0U;
         };
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll

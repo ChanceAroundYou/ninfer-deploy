@@ -40,7 +40,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         float* partial_l,
         // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): the fp8/nvfp4 kernels were the only
         // ones taking the retrieval bitmap; without it a demoted page is read from a recycled slot.
-        const std::uint32_t* selected_blocks) {
+        // `selection_row_words` strides from the shared buffer to this batch's own row.
+        const std::uint32_t* selected_blocks, std::int32_t selection_row_words) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -107,6 +108,11 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
     const std::int32_t* block_table =
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
+    // LOCAL FIX (per-row ring mask, 2026-10-17): the mask belongs to the SEQUENCE, and the sequence
+    // is named by `table_row`, not by the batch slot. Every batch used to read one shared bitmap, so
+    // whichever sequence installed last decided which pages all of them attended.
+    const std::uint32_t* selection =
+        paged_kv_selection(selected_blocks, table_row, selection_row_words);
     if constexpr (MultiBatch) {
         partial_acc +=
             static_cast<std::int64_t>(batch) * D * Geometry::QHeads * TokenTile * split_count;
@@ -405,9 +411,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             // page-aligned, and the fp8 tile-skip also needs its `alpha_s = 1.0` else-branch, which
             // this kernel does not have (alpha_s is written under `if (warp < RowTiles)`).
             const auto block_selected = [&](int key) {
-                if (selected_blocks == nullptr) { return true; }
+                if (selection == nullptr) { return true; }
                 const int page = key >> kPagedKVPageShift;
-                return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+                return ((selection[page >> 5] >> (page & 31)) & 1U) != 0U;
             };
             float bm0       = -CUDART_INF_F;
             float bm1       = -CUDART_INF_F;

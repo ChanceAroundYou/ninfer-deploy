@@ -489,7 +489,7 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
             // prompt_fp8.cuh:266-292 and to the k8v4 route. This one file serves int8, rk8v4, rk4v4
             // and rk2v4-e8 (prompt.cu:145, kv_cache_is_int8_family), so the whole family is covered
             // here. A demoted page's device slot is recycled, so its K/V must not be read at all.
-            const bool selection_active = metadata.selected_blocks != nullptr;
+            const bool selection_active = metadata.selection() != nullptr;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -498,19 +498,19 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
                 const int key1 = key0 + 1;
                 if (!full_score_tile || selection_active) {
                     score[nt][0] =
-                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selection(), key0))
                             ? score[nt][0]
                             : -CUDART_INF_F;
                     score[nt][1] =
-                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selection(), key1))
                             ? score[nt][1]
                             : -CUDART_INF_F;
                     score[nt][2] =
-                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selection(), key0))
                             ? score[nt][2]
                             : -CUDART_INF_F;
                     score[nt][3] =
-                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selection(), key1))
                             ? score[nt][3]
                             : -CUDART_INF_F;
                 }

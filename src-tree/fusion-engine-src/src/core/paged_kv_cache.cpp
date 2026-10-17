@@ -69,12 +69,16 @@ PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cac
         .storage       = cache.storage,
         // LOCAL FIX (ring mask, 2026-10-02): this view used to DROP selected_blocks -- the field was
         // simply absent from the initialiser list, so it defaulted to nullptr. The cached/decode routes
-        // of fp8 and nvfp4 build their invocation from this view and their kernels read
-        // `cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks()`, so the
-        // ring's real bitmap never reached them: those steps ran DENSE over pages the ring had already
-        // demoted, which is the same read-a-recycled-slot defect the mask exists to prevent. A
-        // designated initialiser that omits a field is not a compile error -- that is why this survived.
-        .selected_blocks = cache.selected_blocks,
+        // of fp8 and nvfp4 build their invocation from this view, so the ring's real bitmap never
+        // reached them: those steps ran DENSE over pages the ring had already demoted, which is the
+        // same read-a-recycled-slot defect the mask exists to prevent. A designated initialiser that
+        // omits a field is not a compile error -- that is why this survived.
+        //
+        // `cache` is one row's view, so the bitmap it carries is already that row's own: the kernels
+        // this view feeds resolve their table row to 0 (`table_rows == nullptr`) and add
+        // `0 * selection_row_words`, so a stride of zero is correct here and not a placeholder.
+        .selected_blocks     = cache.selected_blocks,
+        .selection_row_words = 0,
     };
 }
 

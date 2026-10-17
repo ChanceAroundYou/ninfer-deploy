@@ -265,7 +265,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
             const int qabs1            = row1 < tile_rows ? base_pos + q0 + row1 : -1;
             const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
             // ring/retrieval mask must be applied even inside a full score tile (ported from tancau).
-            const bool selection_active = metadata.selected_blocks != nullptr;
+            const bool selection_active = metadata.selection() != nullptr;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -274,19 +274,19 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
                 const int key1 = key0 + 1;
                 if (!full_score_tile || selection_active) {
                     score[nt][0] =
-                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selection(), key0))
                             ? score[nt][0]
                             : -CUDART_INF_F;
                     score[nt][1] =
-                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selection(), key1))
                             ? score[nt][1]
                             : -CUDART_INF_F;
                     score[nt][2] =
-                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selection(), key0))
                             ? score[nt][2]
                             : -CUDART_INF_F;
                     score[nt][3] =
-                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selection(), key1))
                             ? score[nt][3]
                             : -CUDART_INF_F;
                 }

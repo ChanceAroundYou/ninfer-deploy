@@ -1685,6 +1685,15 @@ private:
                           const KVAddressSpaceHandle& address, std::uint32_t total_tokens,
                           std::span<const std::uint32_t> preferred);
 
+    // ---- LOCAL (ring lanes, 2026-10-17): the ring's startup feasibility gate. --------------------
+    // Refuses, at startup and by name, a ring configuration whose lanes cannot all be held at once.
+    // REPLACES the flat "the ring requires --max-concurrency 1" refusal: the ring's single-actor limit
+    // was real (a lane can only reclaim its own pages, so N lanes sizing themselves from the whole pool
+    // ask for more than exists), but it is an arithmetic condition, not a fixed lane count. This checks
+    // that arithmetic against the pool that was actually built, so a configuration the ring CAN serve
+    // is served instead of refused. No-op unless the ring is active.
+    void validate_ring_lane_fit() const;
+
     // LOCAL PROTOTYPE (KVMem-style ring): demote the oldest Device-resident pages (skipping the
     // attention sink and, on the first pass, `preferred`) until at least `target_free` Device pages
     // have been released, or nothing more can be demoted. The content is always preserved on the

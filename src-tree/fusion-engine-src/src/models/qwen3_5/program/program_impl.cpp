@@ -263,6 +263,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
+    // LOCAL (ring lanes, 2026-10-17): the ring's per-lane arithmetic, checked against the pool that
+    // was just built. Runs before anything is served, so an unservable lane count is refused by name
+    // instead of by the first request that happens to need a page.
+    validate_ring_lane_fit();
     if (vision_broker && kv_arena) {
         // A loan changes the admission capacity, so it may not race a sealed plan: refuse one while
         // a context transaction or a pressure-planning session is in flight, and advance the

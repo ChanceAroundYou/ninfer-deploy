@@ -100,13 +100,15 @@ private:
 class KVActivationReservation {
 public:
     KVActivationReservation() noexcept = default;
+    ~KVActivationReservation();
 
     KVActivationReservation(KVActivationReservation&& other) noexcept
         : owner_(std::exchange(other.owner_, nullptr)), address_(other.address_),
           requested_entitlement_(other.requested_entitlement_),
           activation_frontier_(other.activation_frontier_),
           defer_missing_replicas_(other.defer_missing_replicas_),
-          page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)) {}
+          page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)),
+          pinned_pages_(std::move(other.pinned_pages_)) {}
 
     KVActivationReservation& operator=(KVActivationReservation&&)      = delete;
     KVActivationReservation(const KVActivationReservation&)            = delete;
@@ -118,11 +120,13 @@ private:
                             std::optional<std::uint32_t> activation_frontier,
                             DeviceKVPageReservation&& page_reservation,
                             KVExecutionRowLease&& row,
-                            bool defer_missing_replicas) noexcept
+                            bool defer_missing_replicas,
+                            std::vector<LogicalKVPageHandle>&& pinned_pages) noexcept
         : owner_(&owner), address_(address), requested_entitlement_(requested_entitlement),
           activation_frontier_(activation_frontier),
           defer_missing_replicas_(defer_missing_replicas),
-          page_reservation_(std::move(page_reservation)), row_(std::move(row)) {}
+          page_reservation_(std::move(page_reservation)), row_(std::move(row)),
+          pinned_pages_(std::move(pinned_pages)) {}
 
     KVAddressSpaceStore* owner_ = nullptr;
     KVAddressSpaceHandle address_;
@@ -137,6 +141,11 @@ private:
     bool defer_missing_replicas_ = false;
     DeviceKVPageReservation page_reservation_;
     std::optional<KVExecutionRowLease> row_;
+    // LOCAL FIX (2-lane pending activation, 2026-10-17): the pages whose Device replicas this
+    // activation holds against the ring's demotion, pinned by prepare_activation. The reservation
+    // owns no page -- the address does -- so dropping these pins is the whole of its teardown, on
+    // both the commit and the abort path.
+    std::vector<LogicalKVPageHandle> pinned_pages_;
 
     friend class KVAddressSpaceStore;
 };
@@ -339,6 +348,7 @@ public:
         page.active_references = 0;
         page.writer_references = 1;
         page.protected_columns = 0;
+        page.activation_pins   = 0;
         page.occupied          = true;
         return LogicalKVPageHandle(this, index, page.generation);
     }
@@ -391,6 +401,7 @@ public:
             page.active_references = 0;
             page.writer_references = 1;
             page.protected_columns = 0;
+            page.activation_pins   = 0;
             page.occupied          = true;
             destinations[offset]   = LogicalKVPageHandle(this, index, page.generation);
         }
@@ -579,7 +590,8 @@ public:
         const Page& page = pages_[handle.index_];
         return page.device_replica && host_replica_current(handle) &&
                !page.pending_device_replica && page.writer_references == 0 &&
-               page.active_references == 0 && page.source_pins == 0 && !page.destination_pinned;
+               page.active_references == 0 && page.source_pins == 0 && page.activation_pins == 0 &&
+               !page.destination_pinned;
     }
 
     void retain_active_reference(LogicalKVPageHandle handle) {
@@ -670,6 +682,35 @@ public:
         Page& page = require(handle);
         if (page.source_pins == 0) { throw std::logic_error("logical KV source is not pinned"); }
         --page.source_pins;
+    }
+
+    // LOCAL FIX (2-lane pending activation, 2026-10-17): an outstanding activation reservation
+    // charges the Device replicas its commit precondition needs to itself. commit_activation
+    // requires every mapped page in [0, page_count) to be Device-resident, and the address it
+    // activates is a catalogued continuation -- so no active reference, writer reference or source
+    // pin stands on those pages, and the ring's demotion sees them as pure cache. Measured at
+    // --max-concurrency 2: the second lane's decode step demoted the four pages the first lane had
+    // just restored out of its checkpoint, the commit refused the activation, and the abort path
+    // then released the address underneath its own staging (std::terminate, engine death).
+    void pin_activation(LogicalKVPageHandle handle) {
+        Page& page = require(handle);
+        if (page.activation_pins == std::numeric_limits<std::uint32_t>::max()) {
+            throw std::overflow_error("logical KV activation pin count overflow");
+        }
+        ++page.activation_pins;
+    }
+
+    // Releasing the descriptor drops the count with it and advances the generation, so a handle
+    // whose page was released and reused is a no-op here rather than a mis-charge on the next
+    // occupant. That is what makes this safe from a destructor after an abort released the address.
+    void unpin_activation(LogicalKVPageHandle handle) noexcept {
+        if (!valid(handle)) { return; }
+        Page& page = pages_[handle.index_];
+        if (page.activation_pins != 0) { --page.activation_pins; }
+    }
+
+    [[nodiscard]] std::uint32_t activation_pins(LogicalKVPageHandle handle) const noexcept {
+        return valid(handle) ? pages_[handle.index_].activation_pins : 0U;
     }
 
     void commit_coverage(LogicalKVPageHandle handle, std::uint32_t columns) {
@@ -875,6 +916,7 @@ private:
         std::uint32_t active_references = 0;
         std::uint32_t protected_columns = 0;
         std::uint32_t source_pins       = 0;
+        std::uint32_t activation_pins   = 0;
         std::uint8_t writer_references  = 0;
         bool destination_pinned         = false;
         bool occupied                   = false;
@@ -905,6 +947,7 @@ private:
         page.active_references  = 0;
         page.protected_columns  = 0;
         page.source_pins        = 0;
+        page.activation_pins    = 0;
         page.writer_references  = 0;
         page.destination_pinned = false;
         page.occupied           = false;
@@ -1027,9 +1070,20 @@ public:
         pages_->physical_pool().resize_reservation(reservation,
                                                    static_cast<std::uint32_t>(required));
         KVExecutionRowLease row = tables_->acquire(execution_row);
+        // LOCAL FIX (2-lane pending activation, 2026-10-17): charge the activation with the Device
+        // replicas it is about to commit, so the ring's demotion cannot take one in between. Pin
+        // after the row is acquired -- a refused row must leave no pin behind -- and size the vector
+        // first, because a pin is only safe once the reservation that will drop it exists.
+        std::vector<LogicalKVPageHandle> pinned;
+        pinned.reserve(required_pages);
+        for (std::uint32_t page = 0; page < required_pages; ++page) {
+            const LogicalKVPageHandle logical = membership(address, page);
+            pinned.push_back(logical);
+            pages_->pin_activation(logical);
+        }
         return KVActivationReservation(*this, handle, entitlement, activation_frontier,
                                        std::move(reservation), std::move(row),
-                                       defer_missing_replicas);
+                                       defer_missing_replicas, std::move(pinned));
     }
 
     [[nodiscard]] std::vector<LogicalKVPageHandle>
@@ -1110,6 +1164,11 @@ public:
         activation.row_.reset();
         address.active              = true;
         address.checkpoint_frontier = 0;
+        // The address is active from here on, and the ring's demotion already honours that
+        // (demote_other_addresses_to_host skips active addresses), so the pending activation's
+        // charge on the Device replicas is discharged at the moment it stops being pending. Kept
+        // adjacent to `owner_` so no path can leave the two disagreeing.
+        release_activation_pins(activation);
         activation.owner_           = nullptr;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
@@ -1323,6 +1382,23 @@ public:
             pages_->unpin_source(membership(source, page));
         }
         fork.owner_ = nullptr;
+    }
+
+    // The abort is the whole of an activation reservation's ownership: prepare_activation takes no
+    // page of its own, it only charges the Device replicas the commit will require (the same ones
+    // the transaction's staging already accounts for). A stale address is expected here -- an abort
+    // path may release the address before the reservation is destroyed, which is exactly the
+    // sequence that turned the refusal into an engine death -- and unpin_activation ignores a
+    // handle whose descriptor has been released and reused.
+    void abort_activation(KVActivationReservation& activation) noexcept {
+        release_activation_pins(activation);
+        activation.owner_ = nullptr;
+    }
+
+    void release_activation_pins(const KVActivationReservation& activation) noexcept {
+        for (const LogicalKVPageHandle logical : activation.pinned_pages_) {
+            pages_->unpin_activation(logical);
+        }
     }
 
     void abort_prefix_fork(KVPrefixForkReservation& fork) noexcept {
@@ -2212,6 +2288,10 @@ private:
     std::vector<DeviceKVPageHandle> publish_scratch_;
     std::uint32_t free_count_ = 0;
 };
+
+inline KVActivationReservation::~KVActivationReservation() {
+    if (owner_ != nullptr) { owner_->abort_activation(*this); }
+}
 
 inline KVPrefixForkReservation::~KVPrefixForkReservation() {
     if (owner_ != nullptr) { owner_->abort_prefix_fork(*this); }

@@ -131,13 +131,31 @@ PagedKVCache::PagedKVCache(std::span<const DeviceSpan> backings, const PagedKVCa
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
       head_dim_(layout.head_dim), storage_(layout.storage) {
     // LOCAL PROTOTYPE (KVMem-style ring): when the pool is smaller than the logical capacity the
-    // retrieval mask is always active. Allocate its (all-ones) device buffer up front so the
-    // pointer stays stable across CUDA Graph capture, which bakes kernel arguments.
+    // retrieval mask is always active. Allocate every row's bitmap up front, all-selected, so the
+    // pointer stays stable across CUDA Graph capture, which bakes kernel arguments. A sequence that
+    // never installs its own mask then keeps the dense behaviour rather than reading a neighbour's.
     const std::uint32_t logical_pages = page_count(max_context_);
     if (pages_.usable_pages() < logical_pages) {
-        const std::size_t words = (static_cast<std::size_t>(logical_pages) + 31U) / 32U;
+        selection_rows_      = execution_tables_.row_count();
+        selection_row_words_ = static_cast<std::int32_t>(kv_selection_words(logical_pages));
+        if (selection_rows_ <= 0 || selection_row_words_ <= 0) {
+            throw std::invalid_argument("Paged KV retrieval mask geometry is invalid");
+        }
+        const std::size_t words =
+            static_cast<std::size_t>(selection_rows_) * static_cast<std::size_t>(selection_row_words_);
+        selection_row_host_.assign(static_cast<std::size_t>(selection_row_words_), ~0U);
+        if (cudaMalloc(reinterpret_cast<void**>(&selection_device_), words * sizeof(std::uint32_t)) !=
+            cudaSuccess) {
+            selection_device_ = nullptr;
+            throw std::runtime_error("PagedKVCache: retrieval mask allocation failed");
+        }
         std::vector<std::uint32_t> ones(words, ~0U);
-        install_selection(ones);
+        if (cudaMemcpy(selection_device_, ones.data(), words * sizeof(std::uint32_t),
+                       cudaMemcpyHostToDevice) != cudaSuccess) {
+            (void)cudaFree(selection_device_);
+            selection_device_ = nullptr;
+            throw std::runtime_error("PagedKVCache: retrieval mask upload failed");
+        }
     }
 }
 
@@ -177,6 +195,14 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer,
     // another device's memory.
     const Tensor block_table =
         row == nullptr ? Tensor() : execution_tables_.row(*row, layer_rank(layer));
+    // A single-sequence view carries the owning row's own bitmap. The batched view publishes the
+    // buffer base instead and lets each kernel add its own row, so it reads the base here.
+    const std::uint32_t* selection =
+        row == nullptr || selection_device_ == nullptr
+            ? selection_device_
+            : selection_device_ +
+                  static_cast<std::size_t>(row->row_index()) *
+                      static_cast<std::size_t>(selection_row_words_);
     return PagedKVLayerView{
         .k_pages       = pages_.plane(base),
         .v_pages       = pages_.plane(base + 1),
@@ -186,7 +212,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .storage       = storage_,
-        .selected_blocks = selected_blocks_,
+        .selected_blocks = selection,
     };
 }
 
@@ -201,7 +227,8 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .head_dim      = direct.head_dim,
         .num_kv_heads  = direct.num_kv_heads,
         .storage       = direct.storage,
-        .selected_blocks = direct.selected_blocks,
+        .selected_blocks     = selection_device_,
+        .selection_row_words = selection_row_words_,
     };
 }
 
@@ -212,29 +239,33 @@ PagedKVCache::~PagedKVCache() {
     }
 }
 
-void PagedKVCache::install_selection(std::span<const std::uint32_t> words) {
+void PagedKVCache::install_selection(std::int32_t row, std::span<const std::uint32_t> words) {
+    if (selection_device_ == nullptr) {
+        throw std::logic_error("PagedKVCache: retrieval mask installed with no mask buffer");
+    }
+    if (row < 0 || row >= selection_rows_) {
+        throw std::invalid_argument("PagedKVCache: retrieval mask row is out of range");
+    }
     if (words.empty()) {
-        clear_selection();
-        return;
+        throw std::invalid_argument("PagedKVCache: retrieval mask must name at least one page");
     }
-    if (words.size() > selection_words_) {
-        if (selection_device_ != nullptr) {
-            (void)cudaFree(selection_device_);
-            selection_device_ = nullptr;
-        }
-        selection_words_ = 0;
-        if (cudaMalloc(reinterpret_cast<void**>(&selection_device_), words.size_bytes()) !=
-            cudaSuccess) {
-            selection_device_ = nullptr;
-            throw std::runtime_error("PagedKVCache: retrieval bitmap allocation failed");
-        }
-        selection_words_ = words.size();
+    if (words.size() > static_cast<std::size_t>(selection_row_words_)) {
+        throw std::invalid_argument("PagedKVCache: retrieval mask is longer than one row");
     }
-    if (cudaMemcpy(selection_device_, words.data(), words.size_bytes(), cudaMemcpyHostToDevice) !=
-        cudaSuccess) {
-        throw std::runtime_error("PagedKVCache: retrieval bitmap upload failed");
+    // Compose the whole row before uploading it: `words` covers only the pages the caller knows about,
+    // and the tail past it belongs to pages the sequence is still writing into. The scratch row is
+    // reused across installs, so it is reset to all-selected FIRST -- uploading `words` over the
+    // previous installer's tail would select pages for this row that its own caller never chose.
+    std::fill(selection_row_host_.begin(), selection_row_host_.end(), ~0U);
+    std::copy(words.begin(), words.end(), selection_row_host_.begin());
+    std::uint32_t* const row_base =
+        selection_device_ + static_cast<std::size_t>(row) *
+                                static_cast<std::size_t>(selection_row_words_);
+    if (cudaMemcpy(row_base, selection_row_host_.data(),
+                   static_cast<std::size_t>(selection_row_words_) * sizeof(std::uint32_t),
+                   cudaMemcpyHostToDevice) != cudaSuccess) {
+        throw std::runtime_error("PagedKVCache: retrieval mask upload failed");
     }
-    selected_blocks_ = selection_device_;
 }
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);

@@ -227,9 +227,10 @@ void launch_tc_partial_bf16(const Tensor& q, CacheInput input, const Tensor& pos
             cache.block_tables.ne[0], invocation.width, invocation.full_width,
             invocation.column_begin, logical_capacity, scale, static_cast<float*>(partial_acc.data),
             static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
-            // LOCAL FIX (ring mask on the bf16 decode route, 2026-10-02): see the invocation above.
-            invocation.selected_blocks != nullptr ? invocation.selected_blocks
-                                                 : proto_selected_blocks());
+            // LOCAL FIX (per-row ring mask, 2026-10-17): read the bitmap off the view the kernel
+            // already receives. Taking it from the invocation instead let the cached route's nullptr
+            // beat the view's real mask, which ran those steps dense over demoted pages.
+            cache.selected_blocks, cache.selection_row_words);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -445,12 +446,6 @@ void causal_attention_small_t_launch(const Tensor& q, const Tensor& k, const Ten
         .column_begin  = column_begin,
         .width         = width,
         .batch_size    = q.ne[3],
-        // LOCAL FIX (ring mask on the bf16 decode route, 2026-10-02): bf16 is the CLI default dtype,
-        // so this is the route a command line without --kv-dtype lands on. Without the bitmap the
-        // kernel reads whatever slot the block table names -- including one the ring already freed and
-        // handed to another page. nullptr keeps the dense behaviour bit-for-bit.
-        .selected_blocks =
-            cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
     };
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_launch_for<CausalD256H24Kv4>(

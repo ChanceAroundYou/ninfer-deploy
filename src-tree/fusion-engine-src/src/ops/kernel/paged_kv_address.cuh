@@ -21,13 +21,26 @@ __device__ __forceinline__ bool paged_kv_block_selected(const std::uint32_t* sel
     return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
 }
 
+// The bitmap of one execution-table row out of the buffer that holds every row's. `row_words` is
+// passed in rather than derived: the small-T kernels' `logical_capacity` counts TOKENS, so the page
+// count a stride would come from is not available here.
+__device__ __forceinline__ const std::uint32_t* paged_kv_selection(const std::uint32_t* selected_blocks,
+                                                                  std::int32_t row,
+                                                                  std::int32_t row_words) {
+    if (selected_blocks == nullptr) { return nullptr; }
+    return selected_blocks + static_cast<std::int64_t>(row) * row_words;
+}
+
 struct PagedKVDirectMetadata {
     const std::int32_t* table;
+    // The single row this launch reads, so its bitmap is already the one to use.
     const std::uint32_t* selected_blocks;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const { return width; }
 
     __device__ __forceinline__ const std::int32_t* block_table() const { return table; }
+
+    __device__ __forceinline__ const std::uint32_t* selection() const { return selected_blocks; }
 };
 
 template <bool Masked>
@@ -36,7 +49,9 @@ struct PagedKVBatchMetadata {
     const std::int32_t* valid_columns;
     const std::int32_t* table_rows;
     std::int32_t table_stride;
+    // The buffer holding every row's bitmap, and its stride. See `selection()`.
     const std::uint32_t* selected_blocks;
+    std::int32_t selection_row_words;
 
     __device__ __forceinline__ std::int32_t valid_tokens(std::int32_t width) const {
         if constexpr (Masked) {
@@ -48,6 +63,13 @@ struct PagedKVBatchMetadata {
 
     __device__ __forceinline__ const std::int32_t* block_table() const {
         return tables + static_cast<std::int64_t>(table_rows[0]) * table_stride;
+    }
+
+    // This row's bitmap. The prompt route is one row per launch, so it resolves the row the same way
+    // `block_table()` does -- from `table_rows[0]`.
+    __device__ __forceinline__ const std::uint32_t* selection() const {
+        return paged_kv_selection(selected_blocks, table_rows == nullptr ? 0 : table_rows[0],
+                                  selection_row_words);
     }
 };
 

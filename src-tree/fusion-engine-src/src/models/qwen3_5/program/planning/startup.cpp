@@ -1266,21 +1266,24 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
                      "master switch NINFER_TERNARY_KVMEM=0) to fall back to the lexical ranking (that is "
                      "the negative control, not a tuning knob).\n");
     }
-    if (ring_requested() && inputs.max_concurrency > 1) {
-        std::fprintf(stderr,
-                     "[ring] NINFER_KV_WINDOW (KVMem ring) serves ONE active sequence: the ring cannot "
-                     "reclaim another lane's Device pages.\n"
-                     "       Run with --max-concurrency 1, or unset NINFER_KV_WINDOW.\n");
-        throw std::invalid_argument(
-            "NINFER_KV_WINDOW (KVMem ring) requires --max-concurrency 1");
-    }
-    // B06 (RESOLVED 2026-10-10): this guard is gone because the limitation it refused is no longer
-    // reachable. Every KVMem object the scorer writes was a process-wide slot that two lanes shared --
-    // the mean-K index, the raw-K harvest, the score probe, and the norm/rope hook -- so one sequence's
-    // KEPT set could be ranked by another sequence's question. All four are now per-lane, keyed by
-    // SequenceState::lane (mean_k_index_for(lane, ...), raw_k_shadow_harvest_for(lane, ...),
-    // kvmem_score_*(lane, ...), text_set_kvmem_hook(lane, ...)). The RING guard above stays: the ring is
-    // a separate component with its own single-actor reclamation limit, and B06 did not change it.
+    // ---- LOCAL (ring lanes, 2026-10-17): the flat "--max-concurrency 1" refusal is GONE. ----------
+    // It read: "NINFER_KV_WINDOW (KVMem ring) serves ONE active sequence: the ring cannot reclaim
+    // another lane's Device pages." The premise was true and is still true -- a lane can only reclaim
+    // its own pages -- but it does not force one lane. It forces the pool to be DIVIDED, and once it
+    // is, the question is arithmetic: does one lane's sink + budget + slack fit inside its share?
+    // That check now lives where the ring's arithmetic lives, in ProgramImpl::validate_ring_lane_fit
+    // (context.cpp), and runs against the pool actually built. Keeping the flat refusal here would
+    // refuse configurations the ring can serve, which is worse than the arithmetic gate: the operator
+    // gets no numbers and no way to tell "impossible" from "not implemented".
+    //
+    // B06 (RESOLVED 2026-10-10): the per-lane STATE guard is also gone, for a different reason --
+    // the limitation it refused is no longer reachable. Every KVMem object the scorer writes was a
+    // process-wide slot that two lanes shared -- the mean-K index, the raw-K harvest, the score
+    // probe, and the norm/rope hook -- so one sequence's KEPT set could be ranked by another
+    // sequence's question. All four are now per-lane, keyed by SequenceState::lane
+    // (mean_k_index_for(lane, ...), raw_k_shadow_harvest_for(lane, ...), kvmem_score_*(lane, ...),
+    // text_set_kvmem_hook(lane, ...)), and the retrieval mask is per execution-table row
+    // (PagedKVCache::install_selection), which was the sixth shared slot.
     //
     // The known-limitation note this guard pointed at (mean_k_index.h:248-251) carried the second half
     // of the requirement: the arena account must grow by N x mean_k_index_bytes(...). At the shipped

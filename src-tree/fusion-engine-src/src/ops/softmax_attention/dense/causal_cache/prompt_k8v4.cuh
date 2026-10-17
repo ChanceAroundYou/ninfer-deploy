@@ -285,7 +285,7 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
             // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): identical to the fp8 route
             // (prompt_fp8.cuh:266-292). The mask must be applied even inside a full score tile,
             // because a demoted page's slot is reused and the block table still points at it.
-            const bool selection_active = metadata.selected_blocks != nullptr;
+            const bool selection_active = metadata.selection() != nullptr;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
@@ -294,19 +294,19 @@ __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(
                 const int key1 = key0 + 1;
                 if (!full_score_tile || selection_active) {
                     score[nt][0] =
-                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selection(), key0))
                             ? score[nt][0]
                             : -CUDART_INF_F;
                     score[nt][1] =
-                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selection(), key1))
                             ? score[nt][1]
                             : -CUDART_INF_F;
                     score[nt][2] =
-                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selection(), key0))
                             ? score[nt][2]
                             : -CUDART_INF_F;
                     score[nt][3] =
-                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selection(), key1))
                             ? score[nt][3]
                             : -CUDART_INF_F;
                 }
