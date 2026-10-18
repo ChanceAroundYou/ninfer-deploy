@@ -1,2 +1,0 @@
-# The WebUI currently uses only Python standard-library modules.
-# Keep this file explicit so a dedicated venv is reproducible and dependency additions are reviewed.
