@@ -8,7 +8,8 @@
 |---|---|
 | 快照日期 | 2026-10-19 |
 | 上游 | `https://github.com/Niko1221/Strata`，worktree 分支 `main` @ `477ac13` |
-| 内容 | `src/` 7.3 MB（434 个源文件）· `include/` 1.4 MB · `tests/` 692 KB（57 个文件）· `docs/` 的 markdown 948 KB（45 个） |
+| 内容 | `src/` 7.3 MB（237 个 `.cpp/.h/.hpp/.cu/.cuh`）· `include/` 1.4 MB（146 个）· `tests/` 692 KB（51 个源文件 + 6 个 `.txt` fixture，fixture 留本地不入库）· `docs/` 的 markdown 948 KB（45 个） |
+
 | 不含 | `build*/`、`data/`（含 `tests/data/` fixture）、`bench/`（结果）、PDF/media、模型、venv、日志、`tools/`、`cmake/`、`.git/` |
 
 ## 刷新
