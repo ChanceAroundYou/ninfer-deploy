@@ -44,8 +44,8 @@
 
 ### 引用与仓库现状
 
-- **本仓库当前没有源码树**：提交 `d03f0a0` 移除了原先跟踪的 `src-tree/fusion-engine-src/`、`deploy/webui/`、`docs/*.md` 等文件，只保留 git 历史。文中 `generate.cpp:2989-2992`、`generate.cpp:12076`、`generate.cpp:7880`、`conv_cache.hpp`、`DETAILS.md:1126`、`docs/VRAM_ELASTIC.md`、`docs/UNSLOTH_Q4.md:147` 指向**远程 Strata 工作树**（`ssh ai`，`/home/ET/chenran/strata-lab-20261017/`）与上游文档，从未入库；行号对应引擎 `0.1.45` 当时版本，可能已漂移。
-- 本次（2026-10-19）未重新验证任何远端状态：GPU、端口、配置文件、服务状态与所有实测数值均沿用 2026-10-18 的记录。原始测试数据（`/tmp/*.metrics.json`）当时已删除或仅暂存，仓库内不含可复算的原始数据。
+- **本仓库没有源码**：工作树里只有文档与脚本（`git ls-tree -r HEAD` 为空）。文中 `generate.cpp:2989-2992`、`generate.cpp:12076`、`generate.cpp:7880`、`conv_cache.hpp`、`DETAILS.md:1126`、`docs/VRAM_ELASTIC.md`、`docs/UNSLOTH_Q4.md:147` 指向设备 B 的引擎 worktree `/home/ET/chenran/strata-lab-20261017/`；2026-10-19 只读核对确认这些文件都在，其中 `DETAILS.md` 的实际路径是 `docs/DETAILS.md`。行号对应引擎 `0.1.45` 的 2026-10-18 版本，未逐条复核。
+- 2026-10-19 只核对了引用文件是否存在；**没有验证任何运行状态**：GPU 归属、端口、服务状态、配置文件内容与所有实测数值均沿用 2026-10-18 的记录。原始测试数据（`/tmp/*.metrics.json`）当时已删除或仅暂存，仓库内不含可复算的原始数据。
 
 ## 目标与范围
 
