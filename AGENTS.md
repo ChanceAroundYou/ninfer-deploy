@@ -7,8 +7,8 @@
 
 ## 0. 项目身份
 
-- **本仓库是记录仓库**：Strata 部署的实验与运维真相源。只含文档与脚本。
-- **代码权威在设备 B**：`/home/ET/chenran/strata-lab-20261017/` 是 `Niko1221/Strata` 的 git worktree（`src/ include/ tests/ docs/`）。本仓库的 `src-tree/strata-src/` 是它的**镜像快照**，用途是备份与离线编辑（ssh 编辑不便时）。镜像不承载开发：代码改动最终在设备 B 上 commit，本仓库只记录刷新后的快照。
+- **本仓库是记录仓库**：Strata 部署的实验与运维真相源。含文档、脚本，以及引擎源码的镜像快照（`src-tree/`）。
+- **代码权威在设备 B**：`/home/ET/chenran/strata-lab-20261017/` 是 `Niko1221/Strata` 的 git worktree（`src/ include/ tests/ docs/`）。本仓库的 `src-tree/strata-src/` 是它的**镜像快照**（备份 + ssh 编辑不便时的离线编辑区）。改动的落地在设备 B：本地改过的文件要 rsync 回 B 并在 B 上 commit，本仓库只记录刷新后的快照，不充当改动的权威记录。
 - **唯一真相源是 `docs/strata-cache-optimization.md`**。`README.md` 只做索引和速览，不复制数据；两者冲突时以主文档为准，并修正 README 而不是往 README 里加数字。
 
 ---
@@ -18,9 +18,11 @@
 ### 设备 A（开发机，本机）
 文档编辑、脚本维护、结果审阅。只处理脱敏指标，不跑模型、不占 GPU。
 
+本机有一块 GPU（RTX 4070 SUPER）但按规则不用于推理；本地没有 CUDA 工具链（无 `nvcc`）也没有 build tree（2026-10-19 核实），构建与测试只能在设备 B 上跑。
+
 ### 设备 B（AI 服务器，`ssh ai`）
 - 用户 `chenran`，主目录 `/home/ET/chenran/`
-- `~/strata-lab-20261017/` — 引擎源码与测试（git worktree）、lab 配置、bench 与探针脚本
+- `~/strata-lab-20261017/` — 引擎源码与测试（git worktree）、lab 配置与 bench 脚本。本仓库 `scripts/` 里那两个脚本在设备 B 上原本不存在，跑之前先拷过去（`scp scripts/strata_monitor.py ai:~/strata-lab-20261017/`）
 - `~/llm-deploy/` — 生产运行时（`runtime/build-current/`）、模型、WebUI、`rollback-20261018/`、**受保护密钥 `qdl.env`**
 - 文档里提到的 `~/ninfer-deploy`（NInfer 时代的目录）在设备 B 上已不存在
 
@@ -60,7 +62,7 @@ rsync -a -e ssh --include='*/' --include='*.md' --exclude='*' $R/docs/ $D/docs/
 
 - 用绝对日期（`2026-10-18`），不用相对日期。历史章节按日期保留，不在原处改写数字。
 - 未验证项显式列在「未决项 / 未做」，不用「应该」「可能」混入结论。
-- 引用源码时写相对 worktree 路径（例：`src/program/generate.cpp:2989-2992`），引用上游文档同理（`docs/DETAILS.md`，不是 `DETAILS.md`）。行号以本地镜像 `src-tree/strata-src/` 为准，引用前先核对，不能凭记忆写。
+- 引用源码时写相对 worktree 路径（例：`src/program/generate.cpp:2989-2992`；本地镜像里对应 `src-tree/strata-src/src/program/generate.cpp`），引用上游文档同理（`docs/DETAILS.md`，不是 `DETAILS.md`）。行号以本地镜像为准，引用前先核对，不能凭记忆写。
 - 不把远端状态写成当前状态：服务是否运行、GPU 归属、配置文件内容都要实时查；查不到就写「未核实」。
 
 ---
@@ -80,17 +82,17 @@ rsync -a -e ssh --include='*/' --include='*.md' --exclude='*' $R/docs/ $D/docs/
 
 - Conventional Commits：`docs:` / `chore:` / `fix:` / `refactor:`，可带正文。
 - `main` 是唯一分支；需要新分支时先说明理由并在使用后清理。
-- 提交前 `git status` 确认没有把 agent 状态、原始测试数据或构建产物带进去。
+- 提交前 `git status` 确认没有把 agent 状态、原始测试数据或构建产物带进去；**不要用 `git add -A`**（会把 `.claude/` 与 `.omc/` 带进来，2026-10-19 就出过一次）。
 
 ---
 
 ## 6. 脚本
 
-两个脚本只读，跑在设备 B：
+两个脚本只读，在设备 B 上跑（本仓库维护，B 上原本没有，跑之前先拷过去）。
 
-| 脚本 | 用途 |
+| 脚本 | 用途与运行条件 |
 |---|---|
-| `scripts/strata_monitor.py` | `/metrics` + `/proc/PID/{status,limits}` + swap 的告警检查；exit 0 无告警、exit 1 有告警；`--selftest` 证明告警能失败 |
-| `scripts/strata_probe.py` | `MODE=mech` 跨会话缓存保留（交错到达），`MODE=size` 快照内存单价（engine 自报 `snapshot_bytes`） |
+| `scripts/strata_monitor.py` | `/metrics` + `/proc/PID/{status,limits}` + swap 的告警检查；exit 0 无告警、exit 1 有告警。**默认打生产实例 `127.0.0.1:18790`**（`STRATA_BASE` 可改）。PID 优先取 `STRATA_PID`，没给就 `pgrep -f serve.server` 找引擎子进程；两者都没有则报错退出 2 |
+| `scripts/strata_probe.py` | `MODE=mech` 跨会话缓存保留（交错到达）、`MODE=size` 快照内存单价（engine 自报 `snapshot_bytes`）。它**自己启动一个隔离实例**（`serve.server`，`:18080`），不是连现成服务；依赖 lab 的 `strata-iq2_xs.json` 与 `.venv/bin/python`（2026-10-19 核实两者都在） |
 
-新增检查项必须同时证明它**能失败**（跑 `--selftest` 或等价注入），否则该检查等于没建。脚本没有定时任务：只在需要时手动执行；要加定时任务先取得确认。
+只有 monitor 有 `--selftest`（8 项全红、exit 1，不需要 PID）。新增检查项必须同时证明它**能失败**（selftest 或等价注入），否则该检查等于没建。脚本没有定时任务：只在需要时手动执行；要加定时任务先取得确认。
