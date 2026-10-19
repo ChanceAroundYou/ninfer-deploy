@@ -2,14 +2,14 @@
 
 Strata（GPU 推理引擎）部署的实验与运维记录仓库。主体是文档和脚本；`src-tree/` 是引擎源码的**镜像快照** —— 权威源在设备 B（`ssh ai`）的 `/home/ET/chenran/strata-lab-20261017/`，那是 `Niko1221/Strata` 的 git worktree。改动落地在设备 B：可以在本地镜像里编辑，但要 rsync 回 B 并在 B 上 commit，然后刷新镜像。
 
-AI agent 的行为规则与项目事实见 [`AGENTS.md`](AGENTS.md)。镜像的来源与刷新命令见 [`src-tree/README.md`](src-tree/README.md)。
+AI agent 的行为规则与项目事实见 [`AGENTS.md`](AGENTS.md)。
 
 ## 代码与运行环境在哪
 
 | 位置 | 内容 |
 |---|---|
-| 设备 B `~/strata-lab-20261017/` | **引擎源码与测试（权威源）**：`src/ include/ tests/ docs/`，以及 lab 配置与 bench 脚本。git worktree，`main` @ `477ac13`（2026-10-19 核对） |
-| 本仓库 `src-tree/strata-src/` | 上述的镜像快照：434 个源文件（`src` 237 / `include` 146 / `tests` 51）+ 45 个 markdown；`tests/data/` 的 6 个 fixture 只留本地，不入库 |
+| 设备 B `~/strata-lab-20261017/` | **引擎源码与测试（权威源）**：`src/ include/ tests/ docs/`，以及 lab 配置与 bench 脚本。git worktree |
+| 本仓库 `src-tree/strata-src/` | 上述的镜像快照（源文件 + markdown）；`tests/data/` 的 fixture 只留本地，不入库 |
 | 本仓库 `docs/` `scripts/` | 实验记录（真相源）与只读脚本 |
 | 设备 A（本机） | 编辑与审阅。本机有一块 RTX 4070 SUPER 但按规则不用于推理，也没有 CUDA 工具链（无 `nvcc`）和 build tree，构建与测试只能到设备 B 上跑 |
 | 设备 B `~/llm-deploy/` | 生产运行时（`runtime/build-current/`）、模型、WebUI、`rollback-20261018/`、受保护密钥 `qdl.env` |
@@ -27,7 +27,6 @@ llm-deploy/
 │   ├── strata_probe.py              # 只读探测：跨会话缓存保留 / 快照内存单价（自启隔离实例）
 │   └── strata_monitor.py            # 只读监控：/metrics + /proc + swap，exit 1 = 有告警
 ├── src-tree/
-│   ├── README.md                    # 镜像来源、刷新命令、排除清单
 │   └── strata-src/                  # 设备 B worktree 的快照（src/include/tests + docs 的 md）
 └── .claude/ .omc/                   # agent 本地状态，不入 Git
 ```
@@ -50,15 +49,9 @@ MODE=size python3 strata_probe.py      # 单个 park 快照的宿主内存成本
 
 ## 关键结论速览
 
-详见主文档（含每条结论的证据与边界）。数值以主文档为准，此处仅速览：
-
-- **短 system prompt 默认不建 root checkpoint**（`--prompt-cache-root` 默认 2048）。1993-token 的 system prompt 下暖请求全量重读；降到 512 后 read 从 1993 降到 22（−98.9%），TTFT 1.41 s → 0.23 s。
-- **决定改写代价的是保留的 checkpoint 数（`--prompt-cache`），不是 interval**。2×2 四格在同一 slot 数下逐位相同：6 slots 时整段重读，24 slots 时按距离复用 3315 / 6390 / 9894。
-- **多会话缓存池解决跨会话互相淘汰**：池开命中率 64.6% vs 池关 0.0%，prefill 少 2.83×，wall 少 2.45×，全程 `evictions=0`；会话与槽位无亲和性。
-- **池预算是上限不是预留**，且不必要为模型预留：`--conversation-cache-mib 0` 与 `131072` 的引擎 RSS 逐 MiB 相同。缓存净成本按实际 park 的量增长（10 会话 20K–100K ≈ 17.5 GiB）。
-- **显存目标已由静态 reserve 达成**：`--vram-reserve-mib 9216` → 空闲 4990 → 8994 MiB，decode 代价约 0.4%/GiB。`--kv-grow` 与 `--batch` 互斥，对本负载不可用。
-- **质量验收仍缺失**：现有夹具只测缓存指标和固定输出标记，没有任务正确性评估（needle 探针除外）。
+详见主文档（含每条结论的证据与边界）。本节不重复数据。
 
 ## 状态
 
 `main` 是唯一分支。文档中的数值来自 2026-10-18 在设备 B 的实测；原始数据当时仅暂存于远程 `/tmp` 且多数已删除，仓库内不含可复算的原始数据。任何远端状态（GPU、端口、服务、配置）都要实时查，不照抄文档。
+

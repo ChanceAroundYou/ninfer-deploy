@@ -1,7 +1,7 @@
 # AGENTS.md — llm-deploy 项目规则（AI 自动读取）
 
 > 本文件由 Claude Code 自动加载：agent 行为规则、项目事实、工作流与禁令。
-> 人读的索引与关键结论见 `README.md`。
+
 
 ---
 
@@ -9,7 +9,7 @@
 
 - **本仓库是记录仓库**：Strata 部署的实验与运维真相源。含文档、脚本，以及引擎源码的镜像快照（`src-tree/`）。
 - **代码权威在设备 B**：`/home/ET/chenran/strata-lab-20261017/` 是 `Niko1221/Strata` 的 git worktree（`src/ include/ tests/ docs/`）。本仓库的 `src-tree/strata-src/` 是它的**镜像快照**（备份 + ssh 编辑不便时的离线编辑区）。改动的落地在设备 B：本地改过的文件要 rsync 回 B 并在 B 上 commit，本仓库只记录刷新后的快照，不充当改动的权威记录。
-- **唯一真相源是 `docs/strata-cache-optimization.md`**。`README.md` 只做索引和速览，不复制数据；两者冲突时以主文档为准，并修正 README 而不是往 README 里加数字。
+- **唯一真相源是 `docs/strata-cache-optimization.md`**。不复制数据；两者冲突时以主文档为准。
 
 ---
 
@@ -18,7 +18,7 @@
 ### 设备 A（开发机，本机）
 文档编辑、脚本维护、结果审阅。只处理脱敏指标，不跑模型、不占 GPU。
 
-本机有一块 GPU（RTX 4070 SUPER）但按规则不用于推理；本地没有 CUDA 工具链（无 `nvcc`）也没有 build tree（2026-10-19 核实），构建与测试只能在设备 B 上跑。
+本机有一块 GPU（RTX 4070 SUPER）但按规则不用于推理；本地没有 CUDA 工具链（无 `nvcc`）也没有 build tree，构建与测试只能在设备 B 上跑。
 
 ### 设备 B（AI 服务器，`ssh ai`）
 - 用户 `chenran`，主目录 `/home/ET/chenran/`
@@ -43,7 +43,7 @@ rsync -a -e ssh --include='*/' --include='*.md' --exclude='*' $R/docs/ $D/docs/
 
 - 只跟踪 `src/`、`include/`、`tests/` 和 `docs/` 的 markdown。`build*/`、`data/`、`bench/` 结果、PDF/media、模型、venv、日志、`tools/`、`cmake/`、`.git/` 不入库。
 - 在本地镜像里改的文件要 rsync 回设备 B 并在 B 上 commit，然后刷新本地镜像；**不要只在本地 commit 就当作改动已生效**。
-- 当前快照 `477ac13`（2026-10-19）。构建与测试只能在设备 B 上跑（本地没有 CUDA 工具链与 build tree）。
+- 当前快照见 worktree 的 git HEAD。构建与测试只能在设备 B 上跑（本地没有 CUDA 工具链与 build tree）。
 
 ---
 
@@ -95,4 +95,4 @@ rsync -a -e ssh --include='*/' --include='*.md' --exclude='*' $R/docs/ $D/docs/
 | `scripts/strata_monitor.py` | `/metrics` + `/proc/PID/{status,limits}` + swap 的告警检查；exit 0 无告警、exit 1 有告警。**默认打生产实例 `127.0.0.1:18790`**（`STRATA_BASE` 可改）。PID 优先取 `STRATA_PID`，没给就 `pgrep -f serve.server` 找引擎子进程；两者都没有则报错退出 2 |
 | `scripts/strata_probe.py` | `MODE=mech` 跨会话缓存保留（交错到达）、`MODE=size` 快照内存单价（engine 自报 `snapshot_bytes`）。它**自己启动一个隔离实例**（`serve.server`，`:18080`），不是连现成服务；依赖 lab 的 `strata-iq2_xs.json` 与 `.venv/bin/python`（2026-10-19 核实两者都在） |
 
-只有 monitor 有 `--selftest`（8 项全红、exit 1，不需要 PID）。新增检查项必须同时证明它**能失败**（selftest 或等价注入），否则该检查等于没建。脚本没有定时任务：只在需要时手动执行；要加定时任务先取得确认。
+只有 monitor 有 `--selftest`（exit 1，不需要 PID）。新增检查项必须同时证明它**能失败**（selftest 或等价注入），否则该检查等于没建。脚本没有定时任务：只在需要时手动执行；要加定时任务先取得确认。
