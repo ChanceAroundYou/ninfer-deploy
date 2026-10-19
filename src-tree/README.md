@@ -9,7 +9,7 @@
 | 快照日期 | 2026-10-19 |
 | 上游 | `https://github.com/Niko1221/Strata`，worktree 分支 `main` @ `477ac13` |
 | 内容 | `src/` 7.3 MB（434 个源文件）· `include/` 1.4 MB · `tests/` 692 KB（57 个文件）· `docs/` 的 markdown 948 KB（45 个） |
-| 不含 | `build*/`、`data/`、`bench/`（结果）、PDF/media、模型、venv、日志、`tools/`、`cmake/`、`.git/` |
+| 不含 | `build*/`、`data/`（含 `tests/data/` fixture）、`bench/`（结果）、PDF/media、模型、venv、日志、`tools/`、`cmake/`、`.git/` |
 
 ## 刷新
 
@@ -22,7 +22,7 @@ rsync -a -e ssh $R/tests/   $D/tests/
 rsync -a -e ssh --include='*/' --include='*.md' --exclude='*' $R/docs/ $D/docs/
 ```
 
-刷新后 `git status` 应当只看到镜像内的改动；不要把上面排除清单里的东西带进 commit。
+刷新后 `git status` 应当只看到镜像内的改动；不要把上面排除清单里的东西带进 commit。`tests/data/` 的 fixture 保留本地副本但不入库（`.gitignore` 已含）。
 
 ## 已知偏差
 
