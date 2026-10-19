@@ -8,7 +8,7 @@
 ## 0. 项目身份
 
 - **本仓库是记录仓库**：Strata 部署的实验与运维真相源。只含文档与脚本。
-- **不含源码**，且不得试图"恢复"源码：引擎源码在设备 B 的独立 git worktree `/home/ET/chenran/strata-lab-20261017/`（`src/ include/ tests/ docs/`）。本仓库工作树里查不到任何 `.cpp/.h`，这是设计如此。要改引擎代码，先取得确认，并在设备 B 的 worktree 内进行（本仓库历史中的 `src-tree/` 镜像已不再维护）。
+- **代码权威在设备 B**：`/home/ET/chenran/strata-lab-20261017/` 是 `Niko1221/Strata` 的 git worktree（`src/ include/ tests/ docs/`）。本仓库的 `src-tree/strata-src/` 是它的**镜像快照**，用途是备份与离线编辑（ssh 编辑不便时）。镜像不承载开发：代码改动最终在设备 B 上 commit，本仓库只记录刷新后的快照。
 - **唯一真相源是 `docs/strata-cache-optimization.md`**。`README.md` 只做索引和速览，不复制数据；两者冲突时以主文档为准，并修正 README 而不是往 README 里加数字。
 
 ---
@@ -25,6 +25,23 @@
 - 文档里提到的 `~/ninfer-deploy`（NInfer 时代的目录）在设备 B 上已不存在
 
 **GPU 与端口一律实时查**（`nvidia-smi`、`ss -ltn`），不照抄文档里的快照。测试只在测试卡与测试端口上跑（当前约定：GPU 3 / `127.0.0.1:18080`，该 loopback 指设备 B，不是本机）；生产实例只读，不得停止、重启、修改或压测。
+
+### 代码镜像（`src-tree/strata-src/`）
+
+设备 B worktree 的快照，用于备份与离线编辑。刷新（单向，B → 本地）：
+
+```bash
+R=ai:/home/ET/chenran/strata-lab-20261017
+D=src-tree/strata-src
+rsync -a -e ssh $R/src/    $D/src/
+rsync -a -e ssh $R/include/ $D/include/
+rsync -a -e ssh $R/tests/   $D/tests/
+rsync -a -e ssh --include='*/' --include='*.md' --exclude='*' $R/docs/ $D/docs/
+```
+
+- 只跟踪 `src/`、`include/`、`tests/` 和 `docs/` 的 markdown。`build*/`、`data/`、`bench/` 结果、PDF/media、模型、venv、日志、`tools/`、`cmake/`、`.git/` 不入库。
+- 在本地镜像里改的文件要 rsync 回设备 B 并在 B 上 commit，然后刷新本地镜像；**不要只在本地 commit 就当作改动已生效**。
+- 当前快照 `477ac13`（2026-10-19）。构建与测试只能在设备 B 上跑（本地没有 CUDA 工具链与 build tree）。
 
 ---
 
@@ -43,7 +60,7 @@
 
 - 用绝对日期（`2026-10-18`），不用相对日期。历史章节按日期保留，不在原处改写数字。
 - 未验证项显式列在「未决项 / 未做」，不用「应该」「可能」混入结论。
-- 引用源码或上游文档时写相对 worktree 路径（例：`strata-lab-20261017/docs/DETAILS.md`），并注明当时的引擎版本；行号可能漂移，引用前先核对，不能凭记忆写。
+- 引用源码时写相对 worktree 路径（例：`src/program/generate.cpp:2989-2992`），引用上游文档同理（`docs/DETAILS.md`，不是 `DETAILS.md`）。行号以本地镜像 `src-tree/strata-src/` 为准，引用前先核对，不能凭记忆写。
 - 不把远端状态写成当前状态：服务是否运行、GPU 归属、配置文件内容都要实时查；查不到就写「未核实」。
 
 ---

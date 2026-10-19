@@ -1,15 +1,17 @@
 # llm-deploy
 
-Strata（GPU 推理引擎）部署的实验与运维记录仓库。**本仓库只有文档和脚本，不含源码** —— 引擎源码在设备 B（`ssh ai`）的 `/home/ET/chenran/strata-lab-20261017/`，那是一个独立的 git worktree。本仓库工作树里查不到任何 `.cpp/.h`：这是设计如此，不是丢失。
+Strata（GPU 推理引擎）部署的实验与运维记录仓库。主体是文档和脚本；`src-tree/` 是引擎源码的**只读镜像快照** —— 权威源在设备 B（`ssh ai`）的 `/home/ET/chenran/strata-lab-20261017/`，那是 `Niko1221/Strata` 的 git worktree。本仓库不承载开发：改动在设备 B 上完成，镜像定期刷新。
 
-AI agent 的行为规则与项目事实见 [`AGENTS.md`](AGENTS.md)。
+AI agent 的行为规则与项目事实见 [`AGENTS.md`](AGENTS.md)。镜像的来源与刷新命令见 [`src-tree/README.md`](src-tree/README.md)。
 
 ## 代码与运行环境在哪
 
 | 位置 | 内容 |
 |---|---|
-| 设备 A（本机，`/home/nnb/projects/llm-deploy`） | 文档 + 脚本。无源码、无模型、无构建目录、无原始测试数据 |
-| 设备 B `~/strata-lab-20261017/` | 引擎源码与测试（git worktree）：`src/ include/ tests/ docs/`，以及实验用的 lab 配置与 bench 脚本 |
+| 设备 B `~/strata-lab-20261017/` | **引擎源码与测试（权威源）**：`src/ include/ tests/ docs/`，以及 lab 配置与 bench 脚本。git worktree，`main` @ `477ac13`（2026-10-19 核对） |
+| 本仓库 `src-tree/strata-src/` | 上述的镜像快照（434 源文件 + 57 测试 + 45 markdown）。只读，不在此 commit 改动 |
+| 本仓库 `docs/` `scripts/` | 实验记录（真相源）与只读脚本 |
+| 设备 A（本机） | 编辑与审阅。需要跑构建/测试时通过 `ssh ai` 到设备 B；ssh 编辑不便时，可在镜像里编辑后 rsync 回设备 B |
 | 设备 B `~/llm-deploy/` | 生产运行时（`runtime/build-current/`）、模型、WebUI、`rollback-20261018/`、受保护密钥 `qdl.env` |
 
 实验在设备 B 上跑；本机只编辑文档、审阅脱敏指标。
@@ -25,6 +27,9 @@ llm-deploy/
 ├── scripts/
 │   ├── strata_probe.py              # 只读探测：跨会话缓存保留 / 快照内存单价
 │   └── strata_monitor.py            # 只读监控：/metrics + /proc + swap，exit 1 = 有告警
+├── src-tree/
+│   ├── README.md                    # 镜像来源、刷新命令、排除清单
+│   └── strata-src/                  # 设备 B worktree 的快照（src/include/tests + docs 的 md）
 └── .claude/ .omc/                   # agent 本地状态，不入 Git
 ```
 

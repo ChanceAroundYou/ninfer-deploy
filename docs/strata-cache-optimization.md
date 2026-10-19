@@ -44,7 +44,7 @@
 
 ### 引用与仓库现状
 
-- **本仓库没有源码**：工作树里只有文档与脚本（`git ls-tree -r HEAD` 为空）。文中 `generate.cpp:2989-2992`、`generate.cpp:12076`、`generate.cpp:7880`、`conv_cache.hpp`、`DETAILS.md:1126`、`docs/VRAM_ELASTIC.md`、`docs/UNSLOTH_Q4.md:147` 指向设备 B 的引擎 worktree `/home/ET/chenran/strata-lab-20261017/`；2026-10-19 只读核对确认这些文件都在，其中 `DETAILS.md` 的实际路径是 `docs/DETAILS.md`。行号对应引擎 `0.1.45` 的 2026-10-18 版本，未逐条复核。
+- **本仓库不承载开发**：引擎源码的权威在设备 B 的 worktree `/home/ET/chenran/strata-lab-20261017/`（`Niko1221/Strata`）。仓库里的 `src-tree/strata-src/` 是它的镜像快照（2026-10-19，`477ac13`；434 源文件 + 57 测试 + 45 markdown），引用可以在镜像里核对。文中 `generate.cpp:2989-2992`、`generate.cpp:12076`、`generate.cpp:7880`、`conv_cache.hpp`、`DETAILS.md:1126`、`docs/VRAM_ELASTIC.md`、`docs/UNSLOTH_Q4.md:147` 是 2026-10-18 当时的行号（引擎 `0.1.45`）。2026-10-19 在镜像里抽查 4 条（`generate.cpp:2989-2992`、`generate.cpp:12076`、`generate.cpp:7880`、`docs/DETAILS.md:1126`）内容一致，其余未逐条复核。
 - 2026-10-19 只核对了引用文件是否存在；**没有验证任何运行状态**：GPU 归属、端口、服务状态、配置文件内容与所有实测数值均沿用 2026-10-18 的记录。原始测试数据（`/tmp/*.metrics.json`）当时已删除或仅暂存，仓库内不含可复算的原始数据。
 
 ## 目标与范围
@@ -97,6 +97,8 @@
 - 结束后 Strata 进程退出、`:18080` 关闭、GPU 3 回到约 13 MiB；GPU 4 保持约 21.8 GiB 且 `:18492` 监听，GPU 2 为 13 MiB，`ninfer-webui.service` inactive。
 
 重要限制：官方基准 agent 情景是合成 coding-agent session，不等于真实多-agent 流量，也未测试跨 agent 共享前缀、50K/150K 工作负载、动态字段排列或并发轮转。因此此结果仅作为受控合成基线，真实流量基线仍缺失。基准脚本本身有一个未定义 `port` 的启动缺陷；本次在服务器上临时加了一行局部修复以运行官方 suite，结束后已恢复原文件并核对 SHA-256。该变更不在版本化仓库，也未保留临时结果。
+
+> **更正（2026-10-19 核对）**：上一句的"已恢复原文件"不成立。设备 B 上 `tools/strata_bench.py` 相对上游仍有 2 增 1 删的本地改动（把 `server_base(cfg.get("host"), a.port or int(cfg.get("port", 8080)))` 拆成先取 `port` 再调用），即当时那处修复**没有回滚**。该文件不在本仓库镜像范围内（`tools/` 未纳入）。
 
 ## 受控前缀探测（2026-10-18）
 

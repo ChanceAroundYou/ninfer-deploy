@@ -1,0 +1,11 @@
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "8e1e30e", "message": "bug 集立案 B39：结构化工具历史的前缀渲染分叉 => 前缀缓存卡住不涨（issue #7，只落档不修）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "97651d9", "message": "bug 表：把源码验证过的修法落点写进 B33/B34/B35，并立案 B36（响应头缺 charset）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "2e38810", "message": "bug 集立案 B35：输出租约在\"池<上下文\"档位下静默截断（+ 缺陷反馈包入库）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "e800392", "message": "入库：官方 RC2 5070Ti 回执（回执十五）+ 立案 B34（骨架过小 => 深层历史冷取回爆炸）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "e50e13c", "message": "bug 集立案 B33：上下文缓存排不下 ⇒ HTTP 429（连续长请求后，重启才恢复）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "b9f9dc6", "message": "docs: 429 排错指引（区分过载型与缓存排不下型）+ 登记\"先降级后拒绝\"为待做的中型改动", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "f98cb44", "message": "docs: 89 件 8G 完整测试回执入库 + 两条实测口径更正（权重随投机变 / auto 池会被可用显存封顶）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "ec40503", "message": "fix(docs): 修复上一提交损坏的 README 变量块（我的脚本 bug）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "635a277", "message": "fix(build): 补漏 —— -lineinfo 开关的构建输入此前只在本机编译树，未入仓", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T08:47:21.155269+00:00", "sha": "2852f6f", "message": "2026-10-08 复核与测速读数入库：已修项逐条回判 + PQ2 MTP12 单臂", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-15T15:51:59.556494+00:00", "sha": "fe8d5fa", "message": "feat(kvmem): Max group aggregation + LRFU cross-round keep-score (G3/G4 tasks 1-2)", "hook": "stop"}

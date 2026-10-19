@@ -1,0 +1,16 @@
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "2114531", "message": "docs(kvmem): record production ring-off, 3072 pin, and ownership fix", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "f7540e3", "message": "fix(kvmem): bind the score probe to the sequence, not the process", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "f1637b3", "message": "docs(kvmem): record merged A+B six-arm matrix and five-stage acceptance", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "9298c84", "message": "feat(kvmem): G3 action-region query span and G4 adaptive ring budget", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "dafe6ba", "message": "feat(kvmem): Program-owned LRFU rounds with checkpoint history lineage", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "fe8d5fa", "message": "feat(kvmem): Max group aggregation + LRFU cross-round keep-score (G3/G4 tasks 1-2)", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "8e1e30e", "message": "bug 集立案 B39：结构化工具历史的前缀渲染分叉 => 前缀缓存卡住不涨（issue #7，只落档不修）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "97651d9", "message": "bug 表：把源码验证过的修法落点写进 B33/B34/B35，并立案 B36（响应头缺 charset）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "2e38810", "message": "bug 集立案 B35：输出租约在\"池<上下文\"档位下静默截断（+ 缺陷反馈包入库）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T02:28:45.903877+00:00", "sha": "e800392", "message": "入库：官方 RC2 5070Ti 回执（回执十五）+ 立案 B34（骨架过小 => 深层历史冷取回爆炸）", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T04:55:38.359555+00:00", "sha": "bf4de8d", "message": "fix(kvmem): runtime over-subscription for ring lanes, clean prefix-adoption refusal", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T04:55:38.359555+00:00", "sha": "aedb890", "message": "feat(kvmem): per-lane retrieval mask, lane-scoped ring budget, activation pin", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T08:34:17.047630+00:00", "sha": "7d91575", "message": "docs(AGENTS): neutral wording, drop stale sections, fix device description", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T10:01:50.372209+00:00", "sha": "297cc73", "message": "chore: untrack large upstream data fixtures (keep local copies)", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T12:57:26.974605+00:00", "sha": "5016409", "message": "docs: note D1 already satisfied by fixed 256-token query window", "hook": "stop"}
+{"type": "fix_commit", "timestamp": "2026-10-17T16:30:02.123906+00:00", "sha": "3f2d12d", "message": "fix(kvmem): protect shared page residency holds", "hook": "stop"}
